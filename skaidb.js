@@ -273,6 +273,7 @@ class Client {
     this._sock = null;
     this._buf = Buffer.alloc(0);
     this._waiters = [];       // queue of {resolve, reject} awaiting a frame
+    this._frames = [];        // frames that arrived before a reader asked
     this._queryChain = Promise.resolve();
     this._closed = false;
     this._prepared = new Map();
@@ -363,6 +364,12 @@ class Client {
       this._buf = this._buf.subarray(4 + len);
       const w = this._waiters.shift();
       if (w) w.resolve(Buffer.from(frame));
+      // No reader waiting yet: QUEUE the frame, never drop it. A streamed
+      // result arrives as header + chunks + end, and the server can deliver
+      // several of those in one TCP read while the client is still
+      // processing the previous one. Dropping them silently truncated the
+      // stream and then hung waiting for frames already thrown away.
+      else this._frames.push(Buffer.from(frame));
     }
   }
 
@@ -380,6 +387,8 @@ class Client {
   }
 
   _readFrame() {
+    const queued = this._frames.shift();
+    if (queued) return Promise.resolve(queued);
     return new Promise((resolve, reject) => this._waiters.push({ resolve, reject }));
   }
 
@@ -456,6 +465,94 @@ class Client {
     const head = Buffer.allocUnsafe(6);
     head[0] = 1; head[1] = consistency; head.writeUInt32LE(body.length, 2);
     return this._roundtrip(Buffer.concat([head, body]), rowMode);
+  }
+
+  /**
+   * Stream a result set: yields rows one at a time while holding a single
+   * chunk, instead of buffering the whole set. For exports and large scans.
+   *
+   *   for await (const row of client.stream('SELECT ...')) { ... }
+   *
+   * `columns` is available on the returned iterator once iteration starts.
+   * Takes no parameters — the streaming opcode carries SQL text. The
+   * connection is busy until the stream is exhausted; breaking out early
+   * drains the remaining frames so the connection stays usable.
+   */
+  async *stream(sql, opts = {}) {
+    const consistency = opts.consistency === undefined
+      ? this.consistency : resolveConsistency(opts.consistency);
+    const rowMode = opts.rowMode || 'object';
+    // Take the query chain for the whole stream: no other statement may be
+    // in flight on this connection until RowsEnd.
+    let release;
+    let streaming = false;      // a header arrived: frames are still coming
+    const held = new Promise((r) => { release = r; });
+    const prev = this._queryChain;
+    this._queryChain = held;
+    await prev;
+    try {
+      if (this._closed) throw new SkaidbError('connection is closed');
+      const body = Buffer.from(sql, 'utf8');
+      const head = Buffer.allocUnsafe(6);
+      head[0] = 5; head[1] = consistency; head.writeUInt32LE(body.length, 2);
+      this._writeFrame(Buffer.concat([head, body]));
+
+      const first = new Reader(await this._readFrame());
+      const tag = first.u8();
+      if (tag === 3) {
+        const msg = first.text();
+        throw new SkaidbError(msg.includes('unknown opcode')
+          ? `server does not support streaming: ${msg}` : msg);
+      }
+      if (tag === 1 || tag === 2) return;      // mutation/ddl: no rows
+      if (tag !== 5) throw new SkaidbError(`unexpected response tag ${tag} to stream request`);
+      streaming = true;
+      const ncols = first.u32();
+      const fields = [];
+      for (let i = 0; i < ncols; i++) fields.push(first.text());
+      this.stream.columns = fields;
+      for (;;) {
+        const r = new Reader(await this._readFrame());
+        const t = r.u8();
+        if (t === 6) {
+          const n = r.u32();
+          for (let i = 0; i < n; i++) {
+            const ncells = r.u32();
+            const cells = [];
+            for (let c = 0; c < ncells; c++) cells.push(decodeValue(new Reader(r.blob())));
+            if (rowMode === 'array') yield cells;
+            else {
+              const o = {};
+              for (let c = 0; c < fields.length; c++) o[fields[c]] = cells[c];
+              yield o;
+            }
+          }
+        } else if (t === 7) {
+          streaming = false;
+          return;
+        } else if (t === 3) {
+          streaming = false;
+          // Rows already yielded are valid; the statement failed partway.
+          throw new SkaidbError(r.text());
+        } else {
+          throw new SkaidbError(`unexpected frame tag ${t} in stream`);
+        }
+      }
+    } finally {
+      // Abandoned early (a `break`, a throw): the server is still sending.
+      // Drain to RowsEnd, or the leftovers would be read as the reply to the
+      // NEXT statement on this connection.
+      if (streaming && !this._closed) {
+        try {
+          for (;;) {
+            const r = new Reader(await this._readFrame());
+            const t = r.u8();
+            if (t === 7 || t === 3) break;
+          }
+        } catch { /* connection is gone; nothing to drain */ }
+      }
+      release();
+    }
   }
 
   /**
