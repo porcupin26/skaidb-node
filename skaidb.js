@@ -424,6 +424,39 @@ class Client {
   }
 
   /**
+   * Execute `sql` once per row in ONE round-trip. Rows autocommit
+   * individually: a failure names the row and earlier rows stay applied, so
+   * the statement must be idempotent. Returns the total affected count.
+   */
+  batch(sql, rows) {
+    const run = this._queryChain.then(async () => {
+      if (!rows || rows.length === 0) return 0;
+      const q = toQmark(sql, rows[0]);
+      const p = await this._prepare(q.sql);
+      if (!p) throw new SkaidbError('statement cannot be prepared, so it cannot be batched');
+      const ordered = rows.map((r) => toQmark(sql, r).params);
+      for (const r of ordered) {
+        if (r.length !== p.nparams) {
+          throw new SkaidbError(`batch row expects ${p.nparams} parameters, got ${r.length}`);
+        }
+      }
+      const head = Buffer.allocUnsafe(10);
+      head[0] = 7; head[1] = this.consistency;
+      head.writeUInt32LE(p.id, 2); head.writeUInt32LE(ordered.length, 6);
+      const parts = [head];
+      for (const r of ordered) {
+        const cnt = Buffer.alloc(2); cnt.writeUInt16LE(r.length, 0);
+        parts.push(cnt);
+        for (const v of r) { const b = encodeValue(v); parts.push(u32le(b.length), b); }
+      }
+      const res = await this._roundtrip(Buffer.concat(parts), 'object');
+      return res.rowCount || 0;
+    });
+    this._queryChain = run.catch(() => {});
+    return run;
+  }
+
+  /**
    * Prepare `sql` on the SERVER, returning {id, nparams}. Cached per
    * connection — a prepared id only means anything on the connection that
    * created it. Returns null when the server declines the statement kind
