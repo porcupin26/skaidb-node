@@ -9,6 +9,14 @@ export interface ClientOptions {
   password?: string;
   consistency?: Consistency;
   connectTimeout?: number;
+  /** Use TLS. Implied by `tlsCa` or `tlsInsecure`. */
+  tls?: boolean;
+  /** Path to a PEM CA bundle used to verify the server certificate. */
+  tlsCa?: string;
+  /** Encrypt without verifying the certificate. Development only. */
+  tlsInsecure?: boolean;
+  /** SNI name; must match a SAN on the server certificate (default `skaidb`). */
+  tlsServerName?: string;
 }
 
 export interface Field {

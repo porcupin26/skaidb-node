@@ -47,6 +47,18 @@ const client = new Client({ host, port, user, password });
 - Queries on one client are serialized (one request/response in flight); open
   multiple `Client`s for concurrency, or reconnect per worker.
 
+### TLS
+
+```js
+new Client({ ..., tlsCa: '/etc/skaidb/skai-ca.crt' });   // verify against a CA
+new Client({ ..., tlsInsecure: true });                  // encrypt only — dev
+new Client({ ..., tls: true, tlsServerName: 'skaidb' }); // system roots + SNI
+```
+
+A server with `client_tls = required` refuses plaintext connections, so one of
+these is mandatory there. `tlsServerName` must match a SAN on the server
+certificate and defaults to `skaidb` — usually *not* the address you dialled.
+
 ### Consistency
 
 ```js

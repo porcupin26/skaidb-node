@@ -11,6 +11,8 @@
 //   await client.end();
 
 const net = require('net');
+const tls = require('tls');
+const fs = require('fs');
 const crypto = require('crypto');
 
 const CONSISTENCY = { ONE: 0, QUORUM: 1, ALL: 2 };
@@ -150,6 +152,15 @@ class Client {
     this.password = opts.password || '';
     this.consistency = resolveConsistency(opts.consistency);
     this.connectTimeout = opts.connectTimeout || 10000;
+    // TLS. A server with client_tls = required refuses plaintext outright,
+    // so without this such a cluster is unreachable. Any of the three
+    // options turns it on: tls, tlsCa, or tlsInsecure.
+    this.tlsCa = opts.tlsCa || null;
+    this.tlsInsecure = opts.tlsInsecure === true;
+    this.tls = opts.tls === true || this.tlsCa !== null || this.tlsInsecure;
+    // SNI must match a SAN on the server certificate, which is usually not
+    // the address you dialled — skaidb's own certs carry DNS:skaidb.
+    this.tlsServerName = opts.tlsServerName || 'skaidb';
     this._sock = null;
     this._buf = Buffer.alloc(0);
     this._waiters = [];       // queue of {resolve, reject} awaiting a frame
@@ -159,13 +170,39 @@ class Client {
 
   connect() {
     return new Promise((resolve, reject) => {
-      const sock = net.createConnection({ host: this.host, port: this.port });
+      let sock;
+      let ready;                       // event that means "usable transport"
+      if (this.tls) {
+        const opts = {
+          host: this.host,
+          port: this.port,
+          servername: this.tlsServerName,
+        };
+        if (this.tlsInsecure) {
+          // Encrypts, but authenticates nothing: a man in the middle can
+          // present any certificate. Development against a self-signed node
+          // only — pass tlsCa for anything that matters.
+          opts.rejectUnauthorized = false;
+        } else if (this.tlsCa) {
+          try {
+            opts.ca = fs.readFileSync(this.tlsCa);
+          } catch (e) {
+            reject(new SkaidbError(`cannot read tlsCa ${this.tlsCa}: ${e.message}`));
+            return;
+          }
+        }
+        sock = tls.connect(opts);
+        ready = 'secureConnect';       // fires only after the TLS handshake
+      } else {
+        sock = net.createConnection({ host: this.host, port: this.port });
+        ready = 'connect';
+      }
       sock.setNoDelay(true);
       const onErr = (e) => reject(new SkaidbError(`connect failed: ${e.message}`));
       sock.once('error', onErr);
       const to = setTimeout(() => { sock.destroy(); reject(new SkaidbError('connect timeout')); },
         this.connectTimeout);
-      sock.once('connect', () => {
+      sock.once(ready, () => {
         clearTimeout(to);
         sock.removeListener('error', onErr);
         this._sock = sock;
