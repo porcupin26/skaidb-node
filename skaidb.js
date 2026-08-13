@@ -161,6 +161,8 @@ class Client {
     // SNI must match a SAN on the server certificate, which is usually not
     // the address you dialled — skaidb's own certs carry DNS:skaidb.
     this.tlsServerName = opts.tlsServerName || 'skaidb';
+    // Session database, selected with USE right after the handshake.
+    this.database = opts.database || null;
     this._sock = null;
     this._buf = Buffer.alloc(0);
     this._waiters = [];       // queue of {resolve, reject} awaiting a frame
@@ -209,7 +211,11 @@ class Client {
         sock.on('data', (d) => this._onData(d));
         sock.on('error', (e) => this._fail(e));
         sock.on('close', () => this._fail(new SkaidbError('connection closed')));
-        this._handshake().then(resolve, reject);
+        this._handshake()
+          .then(() => this.database
+            ? this.query(`USE "${this.database.replace(/"/g, '""')}"`).then(() => undefined)
+            : undefined)
+          .then(resolve, reject);
       });
     });
   }

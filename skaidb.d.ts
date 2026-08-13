@@ -17,6 +17,8 @@ export interface ClientOptions {
   tlsInsecure?: boolean;
   /** SNI name; must match a SAN on the server certificate (default `skaidb`). */
   tlsServerName?: string;
+  /** Session database, selected with `USE` immediately after connecting. */
+  database?: string;
 }
 
 export interface Field {
