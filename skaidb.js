@@ -31,6 +31,7 @@ class Reader {
     return s;
   }
   u8() { return this.take(1)[0]; }
+  u16() { const b = this.take(2); return b.readUInt16LE(0); }
   u32() { const b = this.take(4); return b.readUInt32LE(0); }
   i64() { return this.take(8).readBigInt64LE(0); }
   u64() { return this.take(8).readBigUInt64LE(0); }
@@ -111,6 +112,101 @@ function quote(arg) {
   throw new SkaidbError(`cannot bind value of type ${typeof arg}`);
 }
 
+/**
+ * Rewrite pg-style `$N` placeholders to the positional `?` the server's
+ * prepared statements use, returning the SQL and the parameters in wire
+ * order. A parameter referenced twice is sent twice — `?` is positional and
+ * has no way to say "the same one again".
+ *
+ * `$N` inside a string literal is left alone, same rule as bindParams.
+ */
+function toQmark(sql, params) {
+  let out = '';
+  const order = [];
+  let inStr = false;
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    if (inStr) {
+      out += ch;
+      if (ch === "'") {
+        if (sql[i + 1] === "'") { out += "'"; i++; } else inStr = false;
+      }
+      continue;
+    }
+    if (ch === "'") { inStr = true; out += ch; continue; }
+    if (ch === '$' && /[0-9]/.test(sql[i + 1] || '')) {
+      let j = i + 1, num = '';
+      while (/[0-9]/.test(sql[j] || '')) { num += sql[j]; j++; }
+      const idx = parseInt(num, 10) - 1;
+      if (idx < 0 || idx >= params.length) throw new SkaidbError(`no parameter for $${num}`);
+      order.push(params[idx]);
+      out += '?';
+      i = j - 1;
+      continue;
+    }
+    out += ch;
+  }
+  return { sql: out, params: order };
+}
+
+/**
+ * Encode a JS value as a TYPED skaidb value (tag + payload) — the inverse of
+ * decodeValue. Arrays become Array and plain objects become Document, which
+ * is the whole point of the prepared path: neither has a SQL literal form.
+ */
+function encodeValue(v) {
+  const parts = [];
+  encodeInto(v, parts);
+  return Buffer.concat(parts);
+}
+
+function u32le(n) { const b = Buffer.alloc(4); b.writeUInt32LE(n >>> 0, 0); return b; }
+
+function encodeInto(v, parts) {
+  if (v === null || v === undefined) { parts.push(Buffer.from([0])); return; }
+  if (typeof v === 'boolean') { parts.push(Buffer.from([1, v ? 1 : 0])); return; }
+  if (typeof v === 'bigint') {
+    const b = Buffer.alloc(8); b.writeBigInt64LE(v, 0);
+    parts.push(Buffer.from([2]), b); return;
+  }
+  if (typeof v === 'number') {
+    if (Number.isInteger(v)) {
+      const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(v), 0);
+      parts.push(Buffer.from([2]), b); return;
+    }
+    if (!Number.isFinite(v)) throw new SkaidbError('cannot bind NaN/Infinity');
+    const b = Buffer.alloc(8); b.writeDoubleLE(v, 0);
+    parts.push(Buffer.from([3]), b); return;
+  }
+  if (typeof v === 'string') {
+    const b = Buffer.from(v, 'utf8');
+    parts.push(Buffer.from([5]), u32le(b.length), b); return;
+  }
+  if (Buffer.isBuffer(v)) {
+    parts.push(Buffer.from([6]), u32le(v.length), v); return;
+  }
+  if (v instanceof Date) {
+    const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(v.getTime()), 0);
+    parts.push(Buffer.from([8]), b); return;
+  }
+  if (Array.isArray(v)) {
+    parts.push(Buffer.from([9]), u32le(v.length));
+    for (const item of v) encodeInto(item, parts);
+    return;
+  }
+  if (typeof v === 'object') {
+    const keys = Object.keys(v);
+    parts.push(Buffer.from([10]), u32le(keys.length));
+    for (const k of keys) {
+      const kb = Buffer.from(k, 'utf8');
+      parts.push(u32le(kb.length), kb);
+      encodeInto(v[k], parts);
+    }
+    return;
+  }
+  throw new SkaidbError(`cannot bind value of type ${typeof v}`);
+}
+
 function bindParams(sql, params) {
   if (!params || params.length === 0) return sql;
   // Replace $N outside string literals.
@@ -168,6 +264,7 @@ class Client {
     this._waiters = [];       // queue of {resolve, reject} awaiting a frame
     this._queryChain = Promise.resolve();
     this._closed = false;
+    this._prepared = new Map();
   }
 
   connect() {
@@ -297,7 +394,23 @@ class Client {
       if (config.rowMode) rowMode = config.rowMode;
     }
     // Serialize queries on this connection (one request/response in flight).
-    const run = this._queryChain.then(() => this._doQuery(bindParams(text, params), consistency, rowMode));
+    const run = this._queryChain.then(async () => {
+      if (params && params.length) {
+        // Server-side prepare so parameters travel as TYPED values; arrays
+        // and documents have no SQL literal form. `$N` is rewritten to the
+        // positional `?` the server expects.
+        const q = toQmark(text, params);
+        const p = await this._prepare(q.sql);
+        if (p) {
+          if (p.nparams !== q.params.length) {
+            throw new SkaidbError(
+              `statement expects ${p.nparams} parameters, got ${q.params.length}`);
+          }
+          return this._doPrepared(p.id, q.params, consistency, rowMode);
+        }
+      }
+      return this._doQuery(bindParams(text, params), consistency, rowMode);
+    });
     this._queryChain = run.catch(() => {}); // keep the chain alive after errors
     return run;
   }
@@ -307,7 +420,51 @@ class Client {
     const body = Buffer.from(sql, 'utf8');
     const head = Buffer.allocUnsafe(6);
     head[0] = 1; head[1] = consistency; head.writeUInt32LE(body.length, 2);
+    return this._roundtrip(Buffer.concat([head, body]), rowMode);
+  }
+
+  /**
+   * Prepare `sql` on the SERVER, returning {id, nparams}. Cached per
+   * connection — a prepared id only means anything on the connection that
+   * created it. Returns null when the server declines the statement kind
+   * (DDL, session statements), so the caller falls back to text binding.
+   */
+  async _prepare(sql) {
+    const hit = this._prepared.get(sql);
+    if (hit) return hit;
+    const body = Buffer.from(sql, 'utf8');
+    const head = Buffer.allocUnsafe(5);
+    head[0] = 2; head.writeUInt32LE(body.length, 1);
     this._writeFrame(Buffer.concat([head, body]));
+    const r = new Reader(await this._readFrame());
+    const tag = r.u8();
+    if (tag === 4) {
+      const id = r.u32();
+      const nparams = r.u16();
+      const v = { id, nparams };
+      if (this._prepared.size < 240) this._prepared.set(sql, v);
+      return v;
+    }
+    if (tag === 3) { r.text(); return null; }   // unpreparable: fall back
+    throw new SkaidbError(`unexpected prepare response tag ${tag}`);
+  }
+
+  /** Execute a prepared statement with TYPED parameters. */
+  async _doPrepared(id, params, consistency, rowMode) {
+    const head = Buffer.allocUnsafe(8);
+    head[0] = 3; head[1] = consistency;
+    head.writeUInt32LE(id, 2); head.writeUInt16LE(params.length, 6);
+    const parts = [head];
+    for (const p of params) {
+      const v = encodeValue(p);
+      parts.push(u32le(v.length), v);
+    }
+    return this._roundtrip(Buffer.concat(parts), rowMode);
+  }
+
+  async _roundtrip(request, rowMode) {
+    if (this._closed) throw new SkaidbError('connection is closed');
+    this._writeFrame(request);
 
     const r = new Reader(await this._readFrame());
     const tag = r.u8();
