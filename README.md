@@ -47,6 +47,15 @@ const client = new Client({ host, port, user, password });
 - Queries on one client are serialized (one request/response in flight); open
   multiple `Client`s for concurrency, or reconnect per worker.
 
+### Failover
+
+```js
+new Client({ seeds: ['db1:7000', 'db2:7000', 'db3:7000'], user, password });
+```
+
+Tried in shuffled order until one connects and authenticates. skaidb is
+leaderless, so any node serves.
+
 ### TLS
 
 ```js

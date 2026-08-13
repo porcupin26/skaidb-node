@@ -244,6 +244,17 @@ class Client {
   constructor(opts = {}) {
     this.host = opts.host || 'localhost';
     this.port = opts.port || 7000;
+    // Seeds: ['h1', 'h2:7000', ...]. skaidb is leaderless, so any node
+    // serves and a seed list is just "somewhere to land" — there is no
+    // primary to discover. Shuffled per connect so many clients spread
+    // across the cluster instead of stampeding the first entry.
+    this.seeds = (opts.seeds && opts.seeds.length ? opts.seeds : [`${this.host}:${this.port}`])
+      .map((s) => {
+        const i = String(s).lastIndexOf(':');
+        return i > 0
+          ? { host: String(s).slice(0, i), port: Number(String(s).slice(i + 1)) }
+          : { host: String(s), port: this.port };
+      });
     this.user = opts.user || 'anonymous';
     this.password = opts.password || '';
     this.consistency = resolveConsistency(opts.consistency);
@@ -267,7 +278,31 @@ class Client {
     this._prepared = new Map();
   }
 
-  connect() {
+  /**
+   * Connect, trying each seed until one connects AND authenticates — a node
+   * that accepts TCP while unhealthy must not swallow the attempt.
+   */
+  async connect() {
+    const order = this.seeds.slice();
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    let last;
+    for (const seed of order) {
+      this.host = seed.host;
+      this.port = seed.port;
+      try {
+        return await this._connectOne();
+      } catch (e) {
+        last = e;
+      }
+    }
+    throw new SkaidbError(
+      `no reachable endpoint in ${order.map((s) => `${s.host}:${s.port}`).join(', ')}: ${last && last.message}`);
+  }
+
+  _connectOne() {
     return new Promise((resolve, reject) => {
       let sock;
       let ready;                       // event that means "usable transport"
