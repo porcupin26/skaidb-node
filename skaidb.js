@@ -275,7 +275,9 @@ class Client {
     this._waiters = [];       // queue of {resolve, reject} awaiting a frame
     this._frames = [];        // frames that arrived before a reader asked
     this._queryChain = Promise.resolve();
-    this._closed = false;
+    this._closed = false;      // end() was called: terminal
+    this._broken = false;      // transport died: recoverable on next statement
+    this._reconnecting = false;
     this._prepared = new Map();
   }
 
@@ -373,11 +375,45 @@ class Client {
     }
   }
 
+  // A transport failure. The in-flight statement (if any) fails — it may
+  // have executed, so retrying it here could duplicate a write — but the
+  // connection is only marked BROKEN, not closed: the next statement calls
+  // _ensureLive and transparently re-dials. end() is what makes a client
+  // terminal.
   _fail(err) {
-    if (this._closed) return;
-    this._closed = true;
+    if (this._closed || this._broken) return;
+    this._broken = true;
     const e = err instanceof Error ? err : new SkaidbError(String(err));
     while (this._waiters.length) this._waiters.shift().reject(e);
+  }
+
+  /**
+   * Re-dial if the transport died, before anything is prepared or sent.
+   *
+   * The prepared-statement cache MUST be cleared: an id is only valid on the
+   * connection that created it, so reusing one after a reconnect would run a
+   * different statement (or fail obscurely). Everything else is per-socket
+   * scratch state and is reset with it.
+   */
+  async _ensureLive() {
+    if (this._closed) throw new SkaidbError('connection is closed');
+    if (!this._broken || this._reconnecting) return;
+    this._reconnecting = true;
+    try {
+      this._prepared.clear();
+      this._waiters = [];
+      this._frames = [];
+      this._buf = Buffer.alloc(0);
+      try { if (this._sock) this._sock.destroy(); } catch (_) { /* already gone */ }
+      this._sock = null;
+      this._broken = false;
+      await this.connect();          // re-runs seed failover + handshake + USE
+    } catch (e) {
+      this._broken = true;           // still down; the next call tries again
+      throw e;
+    } finally {
+      this._reconnecting = false;
+    }
   }
 
   _writeFrame(payload) {
@@ -439,6 +475,9 @@ class Client {
     }
     // Serialize queries on this connection (one request/response in flight).
     const run = this._queryChain.then(async () => {
+      // Recover a transport that died since the last statement, BEFORE
+      // anything is prepared on it (a stale statement id is the hazard).
+      await this._ensureLive();
       if (params && params.length) {
         // Server-side prepare so parameters travel as TYPED values; arrays
         // and documents have no SQL literal form. `$N` is rewritten to the
@@ -562,6 +601,9 @@ class Client {
    */
   batch(sql, rows) {
     const run = this._queryChain.then(async () => {
+      // Recover a transport that died since the last statement, BEFORE
+      // anything is prepared on it (a stale statement id is the hazard).
+      await this._ensureLive();
       if (!rows || rows.length === 0) return 0;
       const q = toQmark(sql, rows[0]);
       const p = await this._prepare(q.sql);
@@ -629,6 +671,7 @@ class Client {
 
   async _roundtrip(request, rowMode) {
     if (this._closed) throw new SkaidbError('connection is closed');
+    if (this._broken) throw new SkaidbError('connection lost');
     this._writeFrame(request);
 
     const r = new Reader(await this._readFrame());
