@@ -705,6 +705,11 @@ class Client {
     throw new SkaidbError(`unknown response tag ${tag}`);
   }
 
+  /** False once end() was called or a transport error broke the socket. */
+  isUsable() {
+    return !this._closed && !this._broken && this._sock !== null;
+  }
+
   end() {
     this._closed = true;
     return new Promise((resolve) => {
@@ -732,4 +737,71 @@ function hmac(key, msg) { return crypto.createHmac('sha256', key).update(msg).di
 function sha256(b) { return crypto.createHash('sha256').update(b).digest(); }
 function xor(a, b) { const o = Buffer.allocUnsafe(a.length); for (let i = 0; i < a.length; i++) o[i] = a[i] ^ b[i]; return o; }
 
-module.exports = { Client, SkaidbError, CONSISTENCY };
+/**
+ * A pool of skaidb connections.
+ *
+ * `maxsize` bounds the connections kept IDLE, not the number checked out:
+ * a burst creates extras and the surplus is closed on return. Every Client
+ * option passes through, so pooled connections inherit seed failover, TLS
+ * and the session database.
+ *
+ *     const pool = new Pool({ seeds: ['h1:7000', 'h2:7000'], database: 'app', maxsize: 8 });
+ *     const res = await pool.withConnection((c) => c.query('SELECT 1'));
+ *     await pool.end();
+ */
+class Pool {
+  constructor(opts = {}) {
+    const { maxsize = 10, ...clientOpts } = opts;
+    if (maxsize < 1) throw new SkaidbError('maxsize must be >= 1');
+    this.maxsize = maxsize;
+    this._opts = clientOpts;
+    this._idle = [];
+    this.closed = false;
+  }
+
+  /** Check out a usable connection, reusing an idle one when possible. */
+  async acquire() {
+    for (;;) {
+      if (this.closed) throw new SkaidbError('pool is closed');
+      const conn = this._idle.pop();
+      if (!conn) {
+        const fresh = new Client(this._opts);
+        await fresh.connect();
+        return fresh;
+      }
+      // A connection the server closed while it sat idle still looks fine
+      // locally, so validate before handing it out; discard and try again.
+      if (conn.isUsable()) return conn;
+      await conn.end().catch(() => {});
+    }
+  }
+
+  /** Return a connection, closing it if it is broken or the pool is full. */
+  async release(conn) {
+    if (!this.closed && conn.isUsable() && this._idle.length < this.maxsize) {
+      this._idle.push(conn);
+      return;
+    }
+    await conn.end().catch(() => {});
+  }
+
+  /** Run `fn` with a checked-out connection, returning it however fn ends. */
+  async withConnection(fn) {
+    const conn = await this.acquire();
+    try {
+      return await fn(conn);
+    } finally {
+      await this.release(conn);
+    }
+  }
+
+  /** Close the pool and every idle connection. Checked-out ones close on release. */
+  async end() {
+    this.closed = true;
+    const idle = this._idle;
+    this._idle = [];
+    await Promise.all(idle.map((c) => c.end().catch(() => {})));
+  }
+}
+
+module.exports = { Client, Pool, SkaidbError, CONSISTENCY };
