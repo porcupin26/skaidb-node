@@ -705,6 +705,37 @@ class Client {
     throw new SkaidbError(`unknown response tag ${tag}`);
   }
 
+  /**
+   * Yield a stream's events as they arrive, forever.
+   *
+   * A dependency-free helper over the stream's log: it pages the log with
+   * the keyset cursor and yields each event ({id, op, k, ts, doc}). `id` is
+   * the position — keep the last one and pass it as `after` to resume
+   * exactly where you stopped, across restarts.
+   *
+   * This polls; for push delivery subscribe to `$stream/<db>/<name>` with
+   * any MQTT client instead. The events are identical.
+   *
+   *   for await (const ev of client.subscribe('big_orders')) { ... }
+   */
+  async *subscribe(stream, { after = null, pollMs = 500 } = {}) {
+    const log = `_stream_${stream}`;
+    let cur = after;
+    for (;;) {
+      const res = cur === null
+        ? await this.query(`SELECT id, op, k, ts, doc FROM ${log} ORDER BY id LIMIT 500`)
+        : await this.query(
+            `SELECT id, op, k, ts, doc FROM ${log} WHERE id > $1 ORDER BY id LIMIT 500`, [cur]);
+      for (const row of res.rows) {
+        cur = row.id;
+        yield row;
+      }
+      if (res.rows.length === 0) {
+        await new Promise((r) => setTimeout(r, pollMs));
+      }
+    }
+  }
+
   /** False once end() was called or a transport error broke the socket. */
   isUsable() {
     return !this._closed && !this._broken && this._sock !== null;
