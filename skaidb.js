@@ -347,6 +347,7 @@ class Client {
         sock.on('error', (e) => this._fail(e));
         sock.on('close', () => this._fail(new SkaidbError('connection closed')));
         this._handshake()
+          .then(() => this._sendHello())
           .then(() => this.database
             ? this.query(`USE "${this.database.replace(/"/g, '""')}"`).then(() => undefined)
             : undefined)
@@ -414,6 +415,23 @@ class Client {
     } finally {
       this._reconnecting = false;
     }
+  }
+
+  /**
+   * Best-effort self-identification: fills the server's `drivers` table
+   * `client_name`/`client_version`. An old server answers the unknown
+   * opcode with an error frame, which is ignored — identity is telemetry,
+   * never load-bearing.
+   */
+  async _sendHello() {
+    try {
+      let version = '0';
+      try { version = require('./package.json').version; } catch (_) { /* vendored single-file */ }
+      const name = Buffer.from('nodejs');
+      const ver = Buffer.from(version);
+      this._writeFrame(Buffer.concat([Buffer.from([8]), u32le(name.length), name, u32le(ver.length), ver]));
+      await this._readFrame();
+    } catch (_) { /* telemetry only */ }
   }
 
   _writeFrame(payload) {
