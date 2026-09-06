@@ -714,6 +714,35 @@ class Client {
       return { command: 'SELECT', rowCount: rows.length, rows, fields,
                columns: fields.map((f) => f.name) };
     }
+    if (tag === 8) {                            // ResultSets (a CALL with EMITs)
+      const sets = [];
+      const nsets = r.u32();
+      for (let s = 0; s < nsets; s++) {
+        const ncols = r.u32();
+        const fields = [];
+        for (let i = 0; i < ncols; i++) fields.push({ name: r.text() });
+        const nrows = r.u32();
+        const rows = [];
+        for (let i = 0; i < nrows; i++) {
+          const ncells = r.u32();
+          const cells = [];
+          for (let c = 0; c < ncells; c++) cells.push(decodeValue(new Reader(r.blob())));
+          if (rowMode === 'array') rows.push(cells);
+          else {
+            const obj = {};
+            for (let c = 0; c < ncells; c++) obj[fields[c].name] = cells[c];
+            rows.push(obj);
+          }
+        }
+        sets.push({ command: 'SELECT', rowCount: rows.length, rows, fields,
+                    columns: fields.map((f) => f.name) });
+      }
+      // The LAST set (the call's final result) is the result's own rows;
+      // every set, in emission order, is under `resultSets`.
+      const last = sets[sets.length - 1] || { rows: [], fields: [], columns: [], rowCount: 0 };
+      return { command: 'CALL', rowCount: last.rowCount, rows: last.rows, fields: last.fields,
+               columns: last.columns, resultSets: sets };
+    }
     if (tag === 1) {                            // Mutation
       const affected = r.u64();
       return { command: 'MUTATION', rowCount: safeInt(affected), rows: [], fields: [] };
