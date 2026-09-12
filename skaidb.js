@@ -17,6 +17,12 @@ const crypto = require('crypto');
 
 const CONSISTENCY = { ONE: 0, QUORUM: 1, ALL: 2 };
 
+// How much of an abandoned stream is worth reading out before dropping the
+// connection instead. The server sends ~256 KB row chunks, so this is a few
+// dozen of them: past that, transferring the remainder of a large scan costs
+// more than the reconnect (TCP + TLS + SCRAM) that replaces the connection.
+const DRAIN_BUDGET_BYTES = 8 * 1024 * 1024;
+
 class SkaidbError extends Error {}
 
 // ---- Value codec (§4 of PROTOCOL.md) --------------------------------------
@@ -389,6 +395,20 @@ class Client {
   }
 
   /**
+   * A frame that cannot be placed in the protocol: after it we no longer
+   * know where the next response starts, so the connection must not be
+   * reused as-is. Marking it broken is the safe fallback to draining —
+   * isUsable() turns false, so a pool discards it instead of handing the
+   * desync to the next caller, and a directly held client re-dials in
+   * _ensureLive() on its next statement. Returns the error to throw.
+   */
+  _desync(msg) {
+    const e = new SkaidbError(msg);
+    this._fail(e);
+    return e;
+  }
+
+  /**
    * Re-dial if the transport died, before anything is prepared or sent.
    *
    * The prepared-statement cache MUST be cleared: an id is only valid on the
@@ -443,6 +463,13 @@ class Client {
   _readFrame() {
     const queued = this._frames.shift();
     if (queued) return Promise.resolve(queued);
+    // Never park a waiter on a socket that is already gone. _fail() rejects
+    // the waiters that existed when the transport died and then goes quiet
+    // (it returns early once _broken is set), so a waiter queued afterwards
+    // would wait for a frame nobody will ever deliver: a stream drained
+    // after a node died mid-scan hung here forever.
+    if (this._broken) return Promise.reject(new SkaidbError('connection lost'));
+    if (this._closed) return Promise.reject(new SkaidbError('connection is closed'));
     return new Promise((resolve, reject) => this._waiters.push({ resolve, reject }));
   }
 
@@ -530,17 +557,32 @@ class Client {
    *
    *   for await (const row of client.stream('SELECT ...')) { ... }
    *
-   * `columns` is available on the returned iterator once iteration starts.
-   * Takes no parameters — the streaming opcode carries SQL text. The
-   * connection is busy until the stream is exhausted; breaking out early
-   * drains the remaining frames so the connection stays usable.
+   * Column names land on `client.stream.columns` once the header arrives.
+   * That slot lives on the shared method, not on the iterator, so it
+   * describes whichever stream started most recently — read it before
+   * starting another. Takes no parameters: the streaming opcode carries SQL
+   * text.
+   *
+   * The connection is busy for the whole stream, and CLOSING the iterator is
+   * what frees it. `break`, `return`, a throw out of the loop body and an
+   * explicit `.return()` all close it, running the drain below so the socket
+   * is left at a request boundary. An iterator that is merely dropped
+   * half-read is closed by nobody — JavaScript has no finalizer that could
+   * do it — and that connection stays busy for good, so always iterate to
+   * the end or close it.
    */
   async *stream(sql, opts = {}) {
     const consistency = opts.consistency === undefined
       ? this.consistency : resolveConsistency(opts.consistency);
     const rowMode = opts.rowMode || 'object';
-    // Take the query chain for the whole stream: no other statement may be
-    // in flight on this connection until RowsEnd.
+    // Hold the query chain for the WHOLE stream rather than per frame, so
+    // no other statement can interleave its frames with ours. Concurrency
+    // choice: a query()/batch() call made meanwhile QUEUES behind the stream
+    // instead of raising "connection busy" — the chain already gives every
+    // other call that semantics, and a caller that reaches for the same
+    // connection from two places expects serialization, not a failure it
+    // has no way to retry against. The price is that an iterator nobody
+    // ever closes wedges those queued calls; see the note above.
     let release;
     let streaming = false;      // a header arrived: frames are still coming
     const held = new Promise((r) => { release = r; });
@@ -548,7 +590,10 @@ class Client {
     this._queryChain = held;
     await prev;
     try {
-      if (this._closed) throw new SkaidbError('connection is closed');
+      // Re-dial a transport that died since the last statement, exactly as
+      // query() does. Without this the request goes into a dead socket and
+      // the reply never comes.
+      await this._ensureLive();
       const body = Buffer.from(sql, 'utf8');
       const head = Buffer.allocUnsafe(6);
       head[0] = 5; head[1] = consistency; head.writeUInt32LE(body.length, 2);
@@ -562,7 +607,7 @@ class Client {
           ? `server does not support streaming: ${msg}` : msg);
       }
       if (tag === 1 || tag === 2) return;      // mutation/ddl: no rows
-      if (tag !== 5) throw new SkaidbError(`unexpected response tag ${tag} to stream request`);
+      if (tag !== 5) throw this._desync(`unexpected response tag ${tag} to stream request`);
       streaming = true;
       const ncols = first.u32();
       const fields = [];
@@ -592,19 +637,33 @@ class Client {
           // Rows already yielded are valid; the statement failed partway.
           throw new SkaidbError(r.text());
         } else {
-          throw new SkaidbError(`unexpected frame tag ${t} in stream`);
+          throw this._desync(`unexpected frame tag ${t} in stream`);
         }
       }
     } finally {
       // Abandoned early (a `break`, a throw): the server is still sending.
       // Drain to RowsEnd, or the leftovers would be read as the reply to the
-      // NEXT statement on this connection.
-      if (streaming && !this._closed) {
+      // NEXT statement on this connection. A broken connection has nothing
+      // to drain and nothing left to desync, so it is skipped.
+      if (streaming && !this._closed && !this._broken) {
         try {
+          let budget = DRAIN_BUDGET_BYTES;
           for (;;) {
-            const r = new Reader(await this._readFrame());
-            const t = r.u8();
-            if (t === 7 || t === 3) break;
+            const f = await this._readFrame();
+            const t = new Reader(f).u8();
+            if (t === 7 || t === 3) break;       // RowsEnd / Error: at a boundary
+            if (t !== 6) {                       // nothing else is legal here
+              this._desync(`unexpected frame tag ${t} while draining stream`);
+              break;
+            }
+            budget -= f.length;
+            if (budget <= 0) {
+              // The rest of this result set is big enough that reading it
+              // out costs more than a reconnect does. Drop the connection
+              // instead — the protocol allows either.
+              this._desync('stream abandoned with too much data left to drain');
+              break;
+            }
           }
         } catch { /* connection is gone; nothing to drain */ }
       }
