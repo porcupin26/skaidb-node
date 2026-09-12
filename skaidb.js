@@ -391,6 +391,18 @@ class Client {
     if (this._closed || this._broken) return;
     this._broken = true;
     const e = err instanceof Error ? err : new SkaidbError(String(err));
+    // Stop the transfer, not just the reader. The socket is in flowing
+    // mode, so leaving it attached means the rest of an abandoned result
+    // keeps arriving and `_onData` keeps pushing frames onto `_frames`
+    // that nothing will ever read — an abandoned 500 MB export was
+    // measured buffering 461 MB of it. The connection is already
+    // unusable at this point, so there is nothing left to protect by
+    // keeping it open, and a half-read stream is precisely the case
+    // where the remaining bytes are worth refusing.
+    try {
+      if (this._sock) this._sock.destroy();
+    } catch (_) { /* already gone */ }
+    this._sock = null;
     while (this._waiters.length) this._waiters.shift().reject(e);
   }
 
