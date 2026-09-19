@@ -73,6 +73,11 @@ Placeholders are `$1, $2, …`. Rules:
   values) throw `no parameter for $3` before anything is sent. Extra values
   are ignored.
 - `$N` inside a single-quoted string literal is text, not a placeholder.
+- `?` is **not** a placeholder. With values given, a statement that contains
+  a bare `?` (outside string literals) and no `$N` at all rejects with
+  `this driver uses $1, $2 … placeholders; '?' is not a placeholder` before
+  anything is sent, instead of the server's puzzling `statement expects N
+  parameters, got 0`.
 - With one or more values the statement is **prepared on the server** and
   executed with typed bindings; see [types.md](types.md) for the mapping.
   The server's parameter count must equal the number of placeholders used
@@ -141,7 +146,8 @@ JavaScript offers no finalizer to rescue this. Always consume or close.
 
 ### `client.subscribe(name, opts?)` → `AsyncGenerator<StreamEvent>`
 
-`opts = { after?: number | null, pollMs?: number }` (defaults `null`, `500`).
+`opts = { after?: string | null, pollMs?: number, signal?: AbortSignal }`
+(defaults `null`, `500`, none).
 Yields the events of the stream `name` (created with `CREATE STREAM`) forever,
 as `{ id, op, k, ts, doc }`: `id` is the log position, `op` the operation,
 `k` the key, `ts` a `Date`, `doc` the document. It runs
@@ -149,6 +155,17 @@ as `{ id, op, k, ts, doc }`: `id` is the log position, `op` the operation,
 repeatedly, sleeping `pollMs` when a page is empty. Persist the last `id` and
 pass it as `after` to resume. Push delivery is available over MQTT on
 `$stream/<db>/<name>` with identical events.
+
+- `id` is an opaque **string** that sorts in log order, such as
+  `"00000001789857620741-0000000000-0902800000000000000100"`, never a
+  number: `after: 0` would issue `WHERE id > 0`, which no id satisfies, and
+  the subscription would yield nothing.
+- Stopping: `break` out of the `for await`, call `.return()` on the
+  iterator, or abort `signal`. Each ends the iteration within a tick while
+  the iterator is idle in its poll sleep (the sleep is woken, not waited
+  out), or as soon as the page fetch in flight completes. An aborted
+  `signal` ends the iteration cleanly, with no error; a signal that is
+  already aborted yields nothing and sends nothing.
 
 ### `client.isUsable(): boolean`
 

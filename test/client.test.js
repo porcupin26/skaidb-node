@@ -56,7 +56,7 @@ test('connect runs SCRAM, verifies the server signature and sends Hello with the
     assert.equal(srv.hellos.length, 1);
     assert.equal(srv.hellos[0].name, 'nodejs');
     assert.equal(srv.hellos[0].version, pkg.version);
-    assert.equal(pkg.version, '1.0.0');
+    assert.equal(pkg.version, '1.0.1');
     await c.end();
     assert.equal(c.isUsable(), false);
   });
@@ -365,11 +365,18 @@ test('Pool reuses idle connections, bounds the idle set, and discards broken one
   });
 });
 
+// Stream log ids as the server really issues them: opaque strings that sort
+// in log order. A driver that treated them as numbers (`after: 0`) would ask
+// for `id > 0`, which no such id satisfies.
+const ID1 = '00000001789857620741-0000000000-0902800000000000000100';
+const ID2 = '00000001789857620741-0000000000-0902800000000000000101';
+const ID3 = '00000001789857620742-0000000000-0902800000000000000100';
+
 test('subscribe pages a stream log with a resumable cursor', async () => {
   const pages = [
-    F.rows(['id', 'op', 'k', 'ts', 'doc'], [[1, 'insert', 'a', new Date(1), { x: 1 }], [2, 'update', 'a', new Date(2), { x: 2 }]]),
+    F.rows(['id', 'op', 'k', 'ts', 'doc'], [[ID1, 'insert', 'a', new Date(1), { x: 1 }], [ID2, 'update', 'a', new Date(2), { x: 2 }]]),
     F.rows(['id', 'op', 'k', 'ts', 'doc'], []),
-    F.rows(['id', 'op', 'k', 'ts', 'doc'], [[3, 'delete', 'a', new Date(3), null]]),
+    F.rows(['id', 'op', 'k', 'ts', 'doc'], [[ID3, 'delete', 'a', new Date(3), null]]),
   ];
   let calls = 0;
   const handle = (req) => {
@@ -385,12 +392,133 @@ test('subscribe pages a stream log with a resumable cursor', async () => {
       got.push(ev);
       if (got.length === 3) break;
     }
-    assert.deepEqual(got.map((e) => [e.id, e.op]), [[1, 'insert'], [2, 'update'], [3, 'delete']]);
+    assert.deepEqual(got.map((e) => [e.id, e.op]), [[ID1, 'insert'], [ID2, 'update'], [ID3, 'delete']]);
+    assert.equal(typeof got[0].id, 'string');
     assert.ok(got[0].ts instanceof Date);
     const first = srv.requests.find((q) => q.op === 1 && /_stream_orders/.test(q.sql));
     assert.match(first.sql, /^SELECT id, op, k, ts, doc FROM _stream_orders ORDER BY id LIMIT 500$/);
     const resumed = srv.requests.find((q) => q.op === 2);
     assert.match(resumed.sql, /WHERE id > \? ORDER BY id LIMIT 500$/);
+    // The cursor travels as the string it is, not coerced to a number.
+    const exec = srv.requests.find((q) => q.op === 3);
+    assert.deepEqual(exec.params, [ID2]);
+    await c.end();
+  });
+});
+
+// An idle subscription answered with empty pages, polling so slowly that a
+// stop which waited out the sleep would time the test out.
+const idleLog = (req) => (req.op === 1 || req.op === 3) ? F.rows(['id', 'op', 'k', 'ts', 'doc'], [])
+  : req.op === 2 ? F.prepared(5, 1) : F.ddl();
+const withinTick = (p, what) => Promise.race([
+  p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} did not settle within 50 ms`)), 50)),
+]);
+
+test('subscribe: return() on an idle iterator resolves promptly instead of waiting out the poll', async () => {
+  await withServer({ handle: idleLog }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const it = c.subscribe('orders', { pollMs: 60_000 });
+    const pending = it.next();                                   // fetches an empty page, then sleeps
+    await until(() => srv.requests.some((q) => q.op === 1 && /_stream_orders/.test(q.sql)));
+    await new Promise((r) => setTimeout(r, 20));                 // let it settle into the sleep
+    const t0 = Date.now();
+    const ret = await withinTick(it.return(), 'return()');
+    assert.deepEqual(ret, { value: undefined, done: true });
+    assert.deepEqual(await withinTick(pending, 'the pending next()'), { value: undefined, done: true });
+    assert.ok(Date.now() - t0 < 50);
+    const polls = srv.requests.filter((q) => q.op === 1 && /_stream_orders/.test(q.sql)).length;
+    assert.equal(polls, 1);                                      // nothing was sent after the stop
+    assert.equal(c.isUsable(), true);                            // the connection is untouched
+    assert.deepEqual(await it.next(), { value: undefined, done: true });
+    await c.end();
+  });
+});
+
+test('subscribe: aborting the signal ends an idle iteration cleanly within a tick', async () => {
+  await withServer({ handle: idleLog }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const ac = new AbortController();
+    let events = 0;
+    const loop = (async () => {
+      for await (const ev of c.subscribe('orders', { pollMs: 60_000, signal: ac.signal })) { events++; void ev; }
+      return 'ended';
+    })();
+    await until(() => srv.requests.some((q) => q.op === 1 && /_stream_orders/.test(q.sql)));
+    await new Promise((r) => setTimeout(r, 20));
+    ac.abort();
+    assert.equal(await withinTick(loop, 'the for-await loop'), 'ended');   // no AbortError
+    assert.equal(events, 0);
+    assert.equal(srv.requests.filter((q) => q.op === 1 && /_stream_orders/.test(q.sql)).length, 1);
+
+    // A signal that is already aborted yields nothing and sends nothing.
+    const before = srv.requests.length;
+    const dead = new AbortController(); dead.abort();
+    assert.deepEqual(await c.subscribe('orders', { signal: dead.signal }).next(), { value: undefined, done: true });
+    assert.equal(srv.requests.length, before);
+    assert.throws(() => c.subscribe('orders', { signal: 'nope' }), /signal must be an AbortSignal/);
+    await c.end();
+  });
+});
+
+test('subscribe: a stop requested while a page is in flight takes effect after that page, without yielding', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const handle = (req, conn) => {
+    if (req.op === 1 && /_stream_orders/.test(req.sql)) {
+      // Answer the page only when the test says so, with one event in it.
+      gate.then(() => conn.send(F.rows(['id', 'op', 'k', 'ts', 'doc'], [[ID1, 'insert', 'a', new Date(1), null]])));
+      return [];
+    }
+    return F.ddl();
+  };
+  await withServer({ handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const it = c.subscribe('orders', { pollMs: 60_000 });
+    const pending = it.next();
+    await until(() => srv.requests.some((q) => q.op === 1 && /_stream_orders/.test(q.sql)));
+    const ret = it.return();                                     // cannot interrupt the fetch itself
+    release();
+    assert.deepEqual(await withinTick(pending, 'the pending next()'), { value: undefined, done: true });
+    assert.deepEqual(await withinTick(ret, 'return()'), { value: undefined, done: true });
+    assert.equal(await c.query('SELECT 1').then(() => 'ok'), 'ok');   // connection at a request boundary
+    await c.end();
+  });
+});
+
+test('subscribe: aborting mid-page stops at the next event instead of draining the page', async () => {
+  const page = F.rows(['id', 'op', 'k', 'ts', 'doc'],
+    [[ID1, 'insert', 'a', new Date(1), null], [ID2, 'insert', 'b', new Date(2), null], [ID3, 'insert', 'c', new Date(3), null]]);
+  const handle = (req) => (req.op === 1 && /_stream_orders/.test(req.sql)) ? page : F.ddl();
+  await withServer({ handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const ac = new AbortController();
+    const seen = [];
+    for await (const ev of c.subscribe('orders', { pollMs: 60_000, signal: ac.signal })) {
+      seen.push(ev.id);
+      ac.abort();                                                // while suspended at the yield
+    }
+    assert.deepEqual(seen, [ID1]);
+    assert.equal(srv.requests.filter((q) => q.op === 1 && /_stream_orders/.test(q.sql)).length, 1);
+    await c.end();
+  });
+});
+
+test('query rejects ? placeholders before sending anything', async () => {
+  await withServer({}, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const before = srv.requests.length;
+    await assert.rejects(c.query('SELECT * FROM t WHERE id = ?', [1]),
+      (e) => e instanceof SkaidbError
+        && e.message === "this driver uses $1, $2 … placeholders; '?' is not a placeholder");
+    await assert.rejects(c.batch('INSERT INTO t VALUES (?)', [[1], [2]]), /'\?' is not a placeholder/);
+    assert.equal(srv.requests.length, before);                   // nothing reached the server
+    assert.equal(c.isUsable(), true);
+    assert.equal((await c.query('SELECT 1')).command, 'DDL');    // the chain is alive
     await c.end();
   });
 });

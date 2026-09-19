@@ -20,7 +20,7 @@ Full documentation: this README, the [`docs/`](docs/) folder
 ## Install
 
 ```sh
-npm install github:porcupin26/skaidb-node#v1.0.0
+npm install github:porcupin26/skaidb-node#v1.0.1
 ```
 
 The package is named `skaidb`, so it is required as `skaidb` whatever the
@@ -264,8 +264,23 @@ for await (const ev of client.subscribe('big_orders', { after: lastSeenId, pollM
 ```
 
 It polls the stream's log (`_stream_<name>`) with a keyset cursor, 500 events
-per page; `id` is the position. For push delivery subscribe to
+per page; `id` is the position — an opaque **string** that sorts in log order
+(`"00000001789857620741-0000000000-0902800000000000000100"`), not a number, so
+`after` takes a saved `id` string or `null`. For push delivery subscribe to
 `$stream/<db>/<name>` with any MQTT client instead — the events are identical.
+
+To stop, `break` out of the loop, call `.return()` on the iterator, or pass an
+`AbortSignal` as `signal` and abort it; each ends the iteration within a tick
+while it is idle between polls (an aborted signal ends it cleanly, without an
+error):
+
+```js
+const ac = new AbortController();
+setTimeout(() => ac.abort(), 60_000);
+for await (const ev of client.subscribe('big_orders', { signal: ac.signal })) {
+  handle(ev);
+}                          // the loop exits when the signal fires
+```
 
 ## Pooling — `new Pool(options)`
 

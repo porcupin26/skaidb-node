@@ -48,6 +48,19 @@ test('toQmark rewrites to positional ? in wire order, repeating reused params', 
   assert.deepEqual(q.params, ['val', 'id', 'id']);
 });
 
+test('toQmark refuses a bare ? as a placeholder when values are given', () => {
+  const msg = /this driver uses \$1, \$2 … placeholders; '\?' is not a placeholder/;
+  assert.throws(() => I.toQmark('SELECT * FROM t WHERE id = ?', [1]), msg);
+  assert.throws(() => I.toQmark('INSERT INTO t VALUES (?, ?)', ['a', 'b']), SkaidbError);
+  // Mixed text with a $N is left to the server's arity check.
+  assert.equal(I.toQmark('SELECT $1, ?', [1]).sql, 'SELECT ?, ?');
+  // A ? inside a string literal is text, and no values means no complaint.
+  assert.equal(I.toQmark("SELECT * FROM t WHERE q = 'why?' AND id = $1", [1]).sql,
+    "SELECT * FROM t WHERE q = 'why?' AND id = ?");
+  assert.equal(I.toQmark("SELECT 'a?'", []).sql, "SELECT 'a?'");
+  assert.equal(I.toQmark('SELECT ?', []).sql, 'SELECT ?');
+});
+
 test('toQmark keeps literals and typed values intact', () => {
   const arr = [1, 2]; const doc = { k: 'v' };
   const q = I.toQmark("INSERT INTO t VALUES ('$1', $1, $2)", [arr, doc]);

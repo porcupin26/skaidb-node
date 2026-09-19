@@ -106,8 +106,12 @@ export interface StreamFunction {
 
 /** One event from a `CREATE STREAM` log, as yielded by `subscribe()`. */
 export interface StreamEvent {
-  /** Position in the log; pass the last one seen as `after` to resume. */
-  id: number;
+  /**
+   * Position in the log: an opaque string that sorts in log order, such as
+   * `"00000001789857620741-0000000000-0902800000000000000100"`. Pass the
+   * last one seen as `after` to resume. It is not a number.
+   */
+  id: string;
   op: string;
   k: Value;
   ts: Date;
@@ -115,10 +119,18 @@ export interface StreamEvent {
 }
 
 export interface SubscribeOptions {
-  /** Resume after this event id. `null` (default) starts from the earliest retained event. */
-  after?: number | null;
+  /**
+   * Resume after this event id (a `StreamEvent.id` string). `null` (default)
+   * starts from the earliest retained event.
+   */
+  after?: string | null;
   /** Poll interval when the log is idle, in milliseconds. Default `500`. */
   pollMs?: number;
+  /**
+   * Aborting it ends the iteration cleanly (no error) within a tick while
+   * the iterator is idle, else once the page fetch in flight completes.
+   */
+  signal?: AbortSignal;
 }
 
 export class Client {
@@ -172,7 +184,9 @@ export class Client {
 
   /**
    * Yield a stream's events as they arrive, forever, by polling its log with
-   * a keyset cursor. Push delivery is available over MQTT instead.
+   * a keyset cursor. Stop it with `break`, `.return()` or `opts.signal`; each
+   * takes effect promptly, even while the iterator is idle in its poll
+   * sleep. Push delivery is available over MQTT instead.
    */
   subscribe(stream: string, opts?: SubscribeOptions): AsyncGenerator<StreamEvent, void, undefined>;
 

@@ -1,6 +1,6 @@
 {
   "name": "skaidb",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Official skaidb driver for Node.js and TypeScript. node-postgres-style API, zero dependencies.",
   "main": "skaidb.js",
   "types": "skaidb.d.ts",

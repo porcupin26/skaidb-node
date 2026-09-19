@@ -11,7 +11,7 @@ The driver has no dependencies and no build step.
 ## Install
 
 ```sh
-npm install github:porcupin26/skaidb-node#v1.0.0
+npm install github:porcupin26/skaidb-node#v1.0.1
 ```
 
 The package name is `skaidb`, so it is required as `skaidb`. Pin a tag as

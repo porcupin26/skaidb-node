@@ -56,15 +56,32 @@ async function main(): Promise<void> {
     break;
   }
 
-  // subscribe(): stream events with a resumable cursor.
-  let cursor: number | null = null;
-  for await (const ev of client.subscribe('big_orders', { after: cursor, pollMs: 250 })) {
+  // subscribe(): stream events with a resumable cursor. Ids are opaque
+  // STRINGS that sort in log order, never numbers.
+  let cursor: string | null = null;
+  const ac = new AbortController();
+  for await (const ev of client.subscribe('big_orders', { after: cursor, pollMs: 250, signal: ac.signal })) {
     const e: StreamEvent = ev;
     cursor = e.id;
+    const id: string = e.id;
     const ts: Date = e.ts;
-    void ts;
+    void [id, ts];
     break;
   }
+  const idle = client.subscribe('big_orders');
+  const ret: IteratorResult<StreamEvent, void> = await idle.return();
+  void ret;
+  // The declarations must REFUSE numeric ids: a consumer saving `ev.id` into
+  // a number, or resuming with `after: 0`, would issue `WHERE id > 0` and
+  // never see an event. @ts-expect-error fails the build if either compiles.
+  for await (const ev of client.subscribe('big_orders')) {
+    // @ts-expect-error a stream id is a string
+    const wrong: number = ev.id;
+    void wrong;
+    break;
+  }
+  // @ts-expect-error `after` takes an id string or null, not a number
+  void client.subscribe('big_orders', { after: 0 });
 
   // Connection state and lifecycle.
   const usable: boolean = client.isUsable();

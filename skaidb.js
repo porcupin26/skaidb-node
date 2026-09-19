@@ -125,11 +125,18 @@ function quote(arg) {
  * has no way to say "the same one again".
  *
  * `$N` inside a string literal is left alone, same rule as bindParams.
+ *
+ * A `?` in the text is NOT a placeholder to this driver, but the server
+ * would happily take it as one and then complain that the statement
+ * "expects N parameters, got 0". So when values are given and the text
+ * contains a bare `?` but no `$N` at all, the mistake is reported here,
+ * before anything is sent.
  */
 function toQmark(sql, params) {
   let out = '';
   const order = [];
   let inStr = false;
+  let sawDollar = false, sawQmark = false;
   for (let i = 0; i < sql.length; i++) {
     const ch = sql[i];
     if (inStr) {
@@ -140,7 +147,9 @@ function toQmark(sql, params) {
       continue;
     }
     if (ch === "'") { inStr = true; out += ch; continue; }
+    if (ch === '?') sawQmark = true;
     if (ch === '$' && /[0-9]/.test(sql[i + 1] || '')) {
+      sawDollar = true;
       let j = i + 1, num = '';
       while (/[0-9]/.test(sql[j] || '')) { num += sql[j]; j++; }
       const idx = parseInt(num, 10) - 1;
@@ -151,6 +160,10 @@ function toQmark(sql, params) {
       continue;
     }
     out += ch;
+  }
+  if (params.length > 0 && sawQmark && !sawDollar) {
+    throw new SkaidbError(
+      "this driver uses $1, $2 … placeholders; '?' is not a placeholder");
   }
   return { sql: out, params: order };
 }
@@ -841,28 +854,69 @@ class Client {
    *
    * A dependency-free helper over the stream's log: it pages the log with
    * the keyset cursor and yields each event ({id, op, k, ts, doc}). `id` is
-   * the position — keep the last one and pass it as `after` to resume
-   * exactly where you stopped, across restarts.
+   * the position, an opaque STRING that sorts in log order — keep the last
+   * one and pass it as `after` to resume exactly where you stopped, across
+   * restarts. (It is not a number: `after: 0` would issue `WHERE id > 0`,
+   * which no string id satisfies.)
+   *
+   * Stopping: `break` out of the loop, call `.return()` on the iterator, or
+   * abort `signal`. Each ends the iteration promptly — within a tick when
+   * the iterator is idle in its poll sleep, else as soon as the page fetch
+   * in flight completes — and an aborted signal ends it cleanly (no error).
    *
    * This polls; for push delivery subscribe to `$stream/<db>/<name>` with
    * any MQTT client instead. The events are identical.
    *
    *   for await (const ev of client.subscribe('big_orders')) { ... }
    */
-  async *subscribe(stream, { after = null, pollMs = 500 } = {}) {
+  subscribe(stream, { after = null, pollMs = 500, signal = null } = {}) {
+    if (signal !== null && signal !== undefined
+        && (typeof signal !== 'object' || typeof signal.aborted !== 'boolean')) {
+      throw new SkaidbError('signal must be an AbortSignal');
+    }
+    // `state.wake` resolves the poll sleep early. An async generator that is
+    // suspended in an `await` cannot see `.return()` until that await
+    // settles, so the iterator's `return` is wrapped to wake the sleep
+    // first; otherwise `return()` on an idle subscription waited out the
+    // whole `pollMs`.
+    const state = { stopped: false, wake: null };
+    const gen = this._subscribe(stream, after, pollMs, signal || null, state);
+    const finish = gen.return.bind(gen);
+    gen.return = (value) => {
+      state.stopped = true;
+      if (state.wake) state.wake();
+      return finish(value);
+    };
+    return gen;
+  }
+
+  async *_subscribe(stream, after, pollMs, signal, state) {
     const log = `_stream_${stream}`;
+    const stop = () => state.stopped || (signal !== null && signal.aborted);
     let cur = after;
-    for (;;) {
+    while (!stop()) {
       const res = cur === null
         ? await this.query(`SELECT id, op, k, ts, doc FROM ${log} ORDER BY id LIMIT 500`)
         : await this.query(
             `SELECT id, op, k, ts, doc FROM ${log} WHERE id > $1 ORDER BY id LIMIT 500`, [cur]);
+      if (stop()) return;                 // stopped while the page was in flight
       for (const row of res.rows) {
+        if (stop()) return;               // aborted mid-page: the rest stays unread
         cur = row.id;
         yield row;
       }
       if (res.rows.length === 0) {
-        await new Promise((r) => setTimeout(r, pollMs));
+        await new Promise((resolve) => {
+          const wake = () => {
+            clearTimeout(timer);
+            if (signal !== null) signal.removeEventListener('abort', wake);
+            state.wake = null;
+            resolve();
+          };
+          const timer = setTimeout(wake, pollMs);
+          state.wake = wake;
+          if (signal !== null) signal.addEventListener('abort', wake, { once: true });
+        });
       }
     }
   }
