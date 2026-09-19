@@ -172,6 +172,7 @@ function encodeInto(v, parts) {
   if (v === null || v === undefined) { parts.push(Buffer.from([0])); return; }
   if (typeof v === 'boolean') { parts.push(Buffer.from([1, v ? 1 : 0])); return; }
   if (typeof v === 'bigint') {
+    if (v < -(1n << 63n) || v >= (1n << 63n)) throw new SkaidbError(`bigint ${v} does not fit a 64-bit integer`);
     const b = Buffer.alloc(8); b.writeBigInt64LE(v, 0);
     parts.push(Buffer.from([2]), b); return;
   }
@@ -349,13 +350,25 @@ class Client {
         clearTimeout(to);
         sock.removeListener('error', onErr);
         this._sock = sock;
-        sock.on('data', (d) => this._onData(d));
-        sock.on('error', (e) => this._fail(e));
-        sock.on('close', () => this._fail(new SkaidbError('connection closed')));
+        // Events from a socket that is no longer the client's are ignored.
+        // _fail() destroys a socket and nulls the slot, but its 'close'
+        // fires on a LATER tick — after a caller may already have re-dialled
+        // through _ensureLive(). Without the guard that stale event marked
+        // the fresh connection broken (and destroyed it), so the statement
+        // right after an abandoned stream failed with "connection lost".
+        sock.on('data', (d) => { if (this._sock === sock) this._onData(d); });
+        sock.on('error', (e) => { if (this._sock === sock) this._fail(e); });
+        sock.on('close', () => { if (this._sock === sock) this._fail(new SkaidbError('connection closed')); });
+        // USE goes straight to the socket, not through query(): a reconnect
+        // runs INSIDE the statement that triggered it, and query() would
+        // queue the USE behind that very statement — a deadlock that hung
+        // every client with a session database on its first statement
+        // after a lost connection.
         this._handshake()
           .then(() => this._sendHello())
           .then(() => this.database
-            ? this.query(`USE "${this.database.replace(/"/g, '""')}"`).then(() => undefined)
+            ? this._doQuery(`USE "${this.database.replace(/"/g, '""')}"`, this.consistency, 'object')
+                .then(() => undefined)
             : undefined)
           .then(resolve, reject);
       });
@@ -954,3 +967,12 @@ class Pool {
 }
 
 module.exports = { Client, Pool, SkaidbError, CONSISTENCY };
+
+// The pure pieces (value codec, parameter binding, framing helpers), exposed
+// for the driver's own unit tests. Not part of the supported API: anything
+// under `_internal` may change between minor versions without notice.
+module.exports._internal = {
+  Reader, decodeValue, encodeValue, bindParams, toQmark, quote,
+  decimalToString, formatUuid, encStr, u32le, resolveConsistency,
+  DRAIN_BUDGET_BYTES,
+};
