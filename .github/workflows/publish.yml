@@ -1,0 +1,41 @@
+name: Publish to npm
+
+# Runs on every v* tag. Publishes only when the NPM_TOKEN repository secret
+# exists; without it the job explains itself and exits green, so tagging a
+# release never fails just because npm publishing has not been set up.
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Tests
+        run: node --check skaidb.js && node --test test/*.test.js
+      - name: Tag matches package.json version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(node -p 'require("./package.json").version')"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag v$tag does not match package.json version $ver"
+            exit 1
+          fi
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::notice title=npm publish skipped::NPM_TOKEN secret is not set; nothing was published. Install from GitHub instead: npm install github:porcupin26/skaidb-node#${GITHUB_REF_NAME}"
+            exit 0
+          fi
+          npm publish --access public

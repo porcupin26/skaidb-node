@@ -1,0 +1,11 @@
+{
+  "name": "skaidb-types-consumer",
+  "private": true,
+  "description": "Compiles a TypeScript consumer against the published skaidb.d.ts. Not part of the package.",
+  "scripts": { "check": "tsc -p ." },
+  "devDependencies": {
+    "@types/node": "^22",
+    "skaidb": "file:../..",
+    "typescript": "^5"
+  }
+}

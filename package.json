@@ -1,11 +1,25 @@
 {
   "name": "skaidb",
-  "version": "0.1.0",
-  "description": "Official skaidb driver for Node.js. node-postgres-style API, zero dependencies.",
+  "version": "1.0.0",
+  "description": "Official skaidb driver for Node.js and TypeScript. node-postgres-style API, zero dependencies.",
   "main": "skaidb.js",
   "types": "skaidb.d.ts",
   "license": "SSPL-1.0",
-  "keywords": ["skaidb", "database", "sql", "driver"],
-  "engines": { "node": ">=16" },
-  "files": ["skaidb.js", "skaidb.d.ts"]
+  "homepage": "https://skaidb.org/docs/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/porcupin26/skaidb-node.git"
+  },
+  "bugs": {
+    "url": "https://github.com/porcupin26/skaidb-node/issues"
+  },
+  "keywords": ["skaidb", "database", "sql", "driver", "client", "cluster", "typescript"],
+  "engines": { "node": ">=18" },
+  "files": ["skaidb.js", "skaidb.d.ts", "package.json", "README.md", "LICENSE", "CHANGELOG.md", "docs/"],
+  "scripts": {
+    "check": "node --check skaidb.js",
+    "test": "node --test test/*.test.js",
+    "typecheck": "cd test/types && npm install --no-audit --no-fund && npx tsc -p .",
+    "pack:check": "npm pack --dry-run"
+  }
 }

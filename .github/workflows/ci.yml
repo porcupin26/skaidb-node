@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Syntax
+        run: node --check skaidb.js
+      - name: Unit tests (node:test, no server needed)
+        run: node --test test/*.test.js
+      - name: Package contents
+        run: npm pack --dry-run
+
+  types:
+    name: TypeScript declarations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Compile a consumer against skaidb.d.ts
+        # test/types installs the driver itself via file:../.. so the check
+        # goes through package.json's "types" and "files", as a user's would.
+        working-directory: test/types
+        run: npm install --no-audit --no-fund && npx tsc -p .
+      - name: Hello version equals package version
+        run: |
+          node -e '
+            const pkg = require("./package.json");
+            const src = require("fs").readFileSync("skaidb.js", "utf8");
+            if (!src.includes("require(\x27./package.json\x27).version")) {
+              console.error("skaidb.js no longer derives the Hello version from package.json");
+              process.exit(1);
+            }
+            if (!pkg.files.includes("package.json")) {
+              console.error("package.json must ship in the package for the Hello version");
+              process.exit(1);
+            }
+            console.log("Hello version source: package.json", pkg.version);
+          '
