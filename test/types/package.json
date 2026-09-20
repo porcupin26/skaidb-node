@@ -5,7 +5,7 @@
   "scripts": { "check": "tsc -p ." },
   "devDependencies": {
     "@types/node": "^22",
-    "skaidb": "file:../..",
+    "@skaidb/client": "file:../..",
     "typescript": "^5"
   }
 }

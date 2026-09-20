@@ -6,7 +6,7 @@
 import {
   Client, Pool, SkaidbError, CONSISTENCY,
   ClientOptions, PoolOptions, QueryResult, QueryConfig, StreamEvent, Value, Consistency,
-} from 'skaidb';
+} from '@skaidb/client';
 
 interface User { id: number; name: string; tags: string[] }
 

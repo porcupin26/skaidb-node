@@ -2,7 +2,7 @@
 //
 //   node examples/basic.js [host] [port] [user] [password]
 //
-// In your own project: const { Client } = require('skaidb');
+// In your own project: const { Client } = require('@skaidb/client');
 const { Client } = require('../skaidb');
 
 const [host = 'localhost', port = '7000', user = 'anonymous', password = ''] = process.argv.slice(2);

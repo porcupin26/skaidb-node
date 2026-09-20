@@ -11,17 +11,18 @@ The driver has no dependencies and no build step.
 ## Install
 
 ```sh
-npm install github:porcupin26/skaidb-node#v1.0.1
+npm install @skaidb/client
 ```
 
-The package name is `skaidb`, so it is required as `skaidb`. Pin a tag as
-above; `#main` follows the development branch. Once the package is on the
-npm registry, `npm install skaidb` is equivalent.
+The package is `@skaidb/client`, so it is required as `@skaidb/client`. To
+install from GitHub instead, `npm install github:porcupin26/skaidb-node#v1.0.2`
+pins a tag and `#main` follows the development branch; the module name is
+the same either way.
 
 ## Connect and query
 
 ```js
-const { Client } = require('skaidb');
+const { Client } = require('@skaidb/client');
 
 async function main() {
   const client = new Client({
@@ -47,7 +48,7 @@ Placeholders are `$1, $2, …`. With parameters the statement is prepared on
 the server and the values are sent typed — that is how the array above gets
 through; it has no SQL literal form.
 
-ESM and TypeScript use `import { Client } from 'skaidb'`.
+ESM and TypeScript use `import { Client } from '@skaidb/client'`.
 
 ## Anonymous connections
 
@@ -89,7 +90,7 @@ retried by the driver (it may have executed).
 Statements on one client run one at a time. For concurrency use a pool:
 
 ```js
-const { Pool } = require('skaidb');
+const { Pool } = require('@skaidb/client');
 const pool = new Pool({ seeds: ['db1:7000', 'db2:7000'], user, password, maxsize: 8 });
 
 const res = await pool.withConnection((c) => c.query('SELECT count(*) AS n FROM users'));

@@ -1,9 +1,10 @@
 {
-  "name": "skaidb",
-  "version": "1.0.1",
+  "name": "@skaidb/client",
+  "version": "1.0.2",
   "description": "Official skaidb driver for Node.js and TypeScript. node-postgres-style API, zero dependencies.",
   "main": "skaidb.js",
   "types": "skaidb.d.ts",
+  "publishConfig": { "access": "public" },
   "license": "SSPL-1.0",
   "homepage": "https://skaidb.org/docs/",
   "repository": {

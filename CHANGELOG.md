@@ -4,6 +4,15 @@ All notable changes to the skaidb Node.js driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] - 2026-09-20
+
+### Changed
+- Published to npm as `@skaidb/client` (package renamed; no code change).
+  Install with `npm install @skaidb/client` and require it as
+  `@skaidb/client`. Installing from GitHub
+  (`npm install github:porcupin26/skaidb-node#v1.0.2`) yields the same
+  module name.
+
 ## [1.0.1] - 2026-09-19
 
 ### Fixed
@@ -76,5 +85,6 @@ carrying its full history over from the skaidb monorepo's `drivers/nodejs`.
 - Package version series restarts at 1.0.0; `engines.node` is `>=18`.
 - The example moved to `examples/basic.js`.
 
+[1.0.2]: https://github.com/porcupin26/skaidb-node/releases/tag/v1.0.2
 [1.0.1]: https://github.com/porcupin26/skaidb-node/releases/tag/v1.0.1
 [1.0.0]: https://github.com/porcupin26/skaidb-node/releases/tag/v1.0.0

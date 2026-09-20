@@ -1,7 +1,7 @@
 # API reference
 
 ```js
-const { Client, Pool, SkaidbError, CONSISTENCY } = require('skaidb');
+const { Client, Pool, SkaidbError, CONSISTENCY } = require('@skaidb/client');
 ```
 
 Everything is exported from the package root. Types for TypeScript are in

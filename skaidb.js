@@ -2,7 +2,7 @@
 // skaidb — Node.js driver. API modeled on node-postgres (`pg`).
 // Pure standard library: `net` + `crypto`. No dependencies.
 //
-//   const { Client } = require('skaidb');
+//   const { Client } = require('@skaidb/client');
 //   const client = new Client({ host: 'localhost', port: 7000,
 //                               user: 'skaidb', password: 'secret' });
 //   await client.connect();

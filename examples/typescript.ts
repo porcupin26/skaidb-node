@@ -2,7 +2,7 @@
 //
 //   npx tsc examples/typescript.ts --module commonjs --target es2020 --esModuleInterop
 //   node examples/typescript.js
-import { Client, SkaidbError, QueryResult } from 'skaidb';
+import { Client, SkaidbError, QueryResult } from '@skaidb/client';
 
 interface Person { id: number; name: string; age: number }
 

@@ -20,17 +20,19 @@ Full documentation: this README, the [`docs/`](docs/) folder
 ## Install
 
 ```sh
-npm install github:porcupin26/skaidb-node#v1.0.1
+npm install @skaidb/client
 ```
 
-The package is named `skaidb`, so it is required as `skaidb` whatever the
-install source. (Once published to the npm registry, `npm install skaidb`
-installs the same package.)
+The package is `@skaidb/client` on the npm registry and is required as
+`@skaidb/client`. To install straight from GitHub instead, pin a tag with
+`npm install github:porcupin26/skaidb-node#v1.0.2` (`#main` follows the
+development branch); the module name is the same whatever the install
+source.
 
 ## Quick start
 
 ```js
-const { Client } = require('skaidb');
+const { Client } = require('@skaidb/client');
 
 const client = new Client({
   host: 'localhost', port: 7000,
@@ -51,7 +53,7 @@ await client.end();
 TypeScript:
 
 ```ts
-import { Client, QueryResult } from 'skaidb';
+import { Client, QueryResult } from '@skaidb/client';
 
 interface User { id: number; name: string }
 const client = new Client({ seeds: ['db1:7000', 'db2:7000'], user: 'app', password: 'secret' });
@@ -285,7 +287,7 @@ for await (const ev of client.subscribe('big_orders', { signal: ac.signal })) {
 ## Pooling — `new Pool(options)`
 
 ```js
-const { Pool } = require('skaidb');
+const { Pool } = require('@skaidb/client');
 const pool = new Pool({ seeds: ['h1:7000', 'h2:7000'], user, password, database: 'app', maxsize: 8 });
 
 const res = await pool.withConnection((c) => c.query('SELECT 1'));

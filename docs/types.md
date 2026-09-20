@@ -42,7 +42,7 @@ any Node project already has.
 ```ts
 import { Client, Pool, SkaidbError, CONSISTENCY,
          ClientOptions, PoolOptions, QueryResult, QueryConfig,
-         StreamOptions, StreamEvent, SubscribeOptions, Value, Consistency } from 'skaidb';
+         StreamOptions, StreamEvent, SubscribeOptions, Value, Consistency } from '@skaidb/client';
 ```
 
 ### Typed rows
@@ -91,7 +91,7 @@ try {
 ### ESM
 
 ```ts
-import { Client } from 'skaidb';            // named imports work: the module is CommonJS
+import { Client } from '@skaidb/client';    // named imports work: the module is CommonJS
 ```
 
 ### Keeping the declarations honest
