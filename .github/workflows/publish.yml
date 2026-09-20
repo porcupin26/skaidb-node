@@ -1,8 +1,19 @@
 name: Publish to npm
 
-# Runs on every v* tag. Publishes only when the NPM_TOKEN repository secret
-# exists; without it the job explains itself and exits green, so tagging a
-# release never fails just because npm publishing has not been set up.
+# Pushing a version tag (v1.2.3) runs the tests, publishes that version of
+# @skaidb/client to the npm registry and creates the GitHub Release, all on
+# GitHub-hosted runners. The tag must equal package.json's "version".
+#
+# npm publishing needs the NPM_TOKEN repository secret: an npm access token
+# of a package maintainer that can publish @skaidb/client without a 2FA
+# code (a classic "automation" token, or a granular access token with
+# "bypass 2FA" and read+write on the package), set under Settings ->
+# Secrets and variables -> Actions. Without it the publish step prints a
+# notice and exits green, so a tag never fails just because npm has not
+# been set up; the GitHub Release is created either way.
+#
+# Re-running the workflow for a tag is safe: a version that is already on
+# npm and a release that already exists are both left alone.
 
 on:
   push:
@@ -12,17 +23,17 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      id-token: write
+      contents: write   # gh release create
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      - name: Tests
-        run: node --check skaidb.js && node --test test/*.test.js
+
       - name: Tag matches package.json version
+        id: version
         run: |
           tag="${GITHUB_REF_NAME#v}"
           ver="$(node -p 'require("./package.json").version')"
@@ -30,12 +41,52 @@ jobs:
             echo "::error::tag v$tag does not match package.json version $ver"
             exit 1
           fi
-      - name: Publish
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "name=$(node -p 'require("./package.json").name')" >> "$GITHUB_OUTPUT"
+
+      - name: Tests
+        run: |
+          node --check skaidb.js
+          node --test test/*.test.js
+          npm pack --dry-run
+
+      - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NAME: ${{ steps.version.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::notice title=npm publish skipped::NPM_TOKEN secret is not set; nothing was published. Install from GitHub instead: npm install github:porcupin26/skaidb-node#${GITHUB_REF_NAME}"
+            echo "::notice title=npm publish skipped::the NPM_TOKEN repository secret is not set, so $NAME@$VERSION was NOT published to npm. Add the secret and re-run this workflow, or install from GitHub: npm install github:${GITHUB_REPOSITORY}#${GITHUB_REF_NAME}"
+            exit 0
+          fi
+          if [ "$(npm view "$NAME@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "::notice title=npm publish skipped::$NAME@$VERSION is already on the registry; nothing to do."
             exit 0
           fi
           npm publish --access public
+          echo "::notice title=published to npm::$NAME@$VERSION is at https://www.npmjs.com/package/$NAME/v/$VERSION"
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.version.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME already exists; leaving it as it is"
+            exit 0
+          fi
+          # The release notes are this version's section of CHANGELOG.md
+          # (everything between its "## [x.y.z]" heading and the next one).
+          notes="$(awk -v v="$VERSION" '
+            /^## \[/ { if (on) exit; on = (substr($0, 4, length(v) + 2) == "[" v "]"); next }
+            on { print }
+          ' CHANGELOG.md | sed -e '/./,$!d')"
+          if [ -z "$notes" ]; then
+            echo "::warning::CHANGELOG.md has no [$VERSION] section; the release notes are generated from the commits instead"
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+            exit 0
+          fi
+          notes="$(printf '%s\n\nInstall: `npm install %s@%s`\n' "$notes" "$NAME" "$VERSION")"
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --notes "$notes"

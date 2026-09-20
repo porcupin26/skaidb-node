@@ -56,7 +56,7 @@ test('connect runs SCRAM, verifies the server signature and sends Hello with the
     assert.equal(srv.hellos.length, 1);
     assert.equal(srv.hellos[0].name, 'nodejs');
     assert.equal(srv.hellos[0].version, pkg.version);
-    assert.equal(pkg.version, '1.0.2');
+    assert.equal(pkg.version, '1.0.3');
     await c.end();
     assert.equal(c.isUsable(), false);
   });

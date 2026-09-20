@@ -4,6 +4,14 @@ All notable changes to the skaidb Node.js driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.3] - 2026-09-20
+
+### Changed
+- Release automation: published from GitHub Actions. Pushing a `vX.Y.Z`
+  tag now runs the tests, publishes `@skaidb/client` to npm and creates
+  the GitHub Release from this changelog section (no code change; see
+  `RELEASING.md`).
+
 ## [1.0.2] - 2026-09-20
 
 ### Changed
