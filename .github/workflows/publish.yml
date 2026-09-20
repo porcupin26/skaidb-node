@@ -7,9 +7,10 @@ name: Publish to npm
 # npm publishing needs the NPM_TOKEN repository secret: an npm access token
 # of a package maintainer that can publish @skaidb/client without a 2FA
 # code (a classic "automation" token, or a granular access token with
-# "bypass 2FA" and read+write on the package), set under Settings ->
-# Secrets and variables -> Actions. Without it the publish step prints a
-# notice and exits green, so a tag never fails just because npm has not
+# "bypass 2FA" and read+write on the package) and that has no IP
+# allowlist (GitHub-hosted runners use changing addresses), set under
+# Settings -> Secrets and variables -> Actions. Without it the publish
+# step prints a notice and exits green, so a tag never fails just because npm has not
 # been set up; the GitHub Release is created either way.
 #
 # Re-running the workflow for a tag is safe: a version that is already on
@@ -64,7 +65,10 @@ jobs:
             echo "::notice title=npm publish skipped::$NAME@$VERSION is already on the registry; nothing to do."
             exit 0
           fi
-          npm publish --access public
+          if ! npm publish --access public; then
+            echo "::error title=npm publish failed::npm rejected $NAME@$VERSION. A 404 on the PUT means the NPM_TOKEN secret cannot publish this package: the token must not be expired or revoked, must have read+write on $NAME or on its org, must bypass 2FA and must have NO IP allowlist (GitHub-hosted runners use changing addresses). Fix the token, update the secret and re-run this job; nothing needs re-tagging."
+            exit 1
+          fi
           echo "::notice title=published to npm::$NAME@$VERSION is at https://www.npmjs.com/package/$NAME/v/$VERSION"
 
       - name: GitHub Release

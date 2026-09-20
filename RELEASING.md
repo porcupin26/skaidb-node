@@ -33,5 +33,8 @@ patch version and tag again.
 
 `NPM_TOKEN` is an npm access token of a package maintainer that can publish
 without a 2FA code (a classic **automation** token, or a granular access
-token with *bypass 2FA* and read+write on `@skaidb/client`), set under the
-repository's Settings → Secrets and variables → Actions.
+token with *bypass 2FA* and read+write on `@skaidb/client`) and that has
+no IP allowlist (GitHub-hosted runners use changing addresses), set under
+the repository's Settings → Secrets and variables → Actions. If the
+publish step fails with `404 Not Found - PUT …`, the token is what to
+check; then re-run the failed job.
