@@ -14,7 +14,7 @@ Everything is exported from the package root. Types for TypeScript are in
 | `host` | `string` | `'localhost'` | Host to dial when `seeds` is not given. |
 | `port` | `number` | `7000` | Port to dial; also the port for a seed given without one. |
 | `seeds` | `string[]` | — | `['h1:7000', 'h2:7000', 'h3']`. Overrides `host`/`port`. Shuffled on every connect. |
-| `user` | `string` | `'anonymous'` | User name. |
+| `user` | `string` | `'anonymous'` (`''` with certificate login) | User name. With `authMechanism: 'certificate'` it only asserts the identity (must equal the certificate's CN). |
 | `password` | `string` | `''` | Password. Empty means anonymous; mutual authentication is skipped. |
 | `database` | `string` | — | Selected with `USE` after every (re)connect. |
 | `consistency` | `'ONE' \| 'QUORUM' \| 'ALL' \| 0 \| 1 \| 2` | `'QUORUM'` | Default for every statement on this client. Names are case-insensitive. |
@@ -23,14 +23,20 @@ Everything is exported from the package root. Types for TypeScript are in
 | `tlsCa` | `string` (path) | — | PEM CA bundle to verify the server against. Implies `tls`. |
 | `tlsInsecure` | `boolean` | `false` | TLS without certificate verification. Implies `tls`. Development only. |
 | `tlsServerName` | `string` | `'skaidb'` | SNI and verification name; must match a SAN on the server certificate. |
+| `tlsClientCert` | `string` (path) | — | PEM client certificate presented in the TLS handshake. Needs `tlsClientKey`; implies `tls`. |
+| `tlsClientKey` | `string` (path) | — | PEM private key of `tlsClientCert`. |
+| `authMechanism` | `'scram' \| 'certificate'` | `'scram'` | `'certificate'` logs in with the client certificate (wire mechanism EXTERNAL): its Common Name is the user and no password is sent. Needs `tlsClientCert`/`tlsClientKey`. |
 
 The constructor only stores the configuration; nothing is dialled until
-`connect()`.
+`connect()`. It throws `SkaidbError` for an unknown `authMechanism`, a
+`tlsClientCert` without `tlsClientKey` (or the reverse), and
+`authMechanism: 'certificate'` without a client certificate.
 
 Public fields after construction: `host`, `port` (the endpoint most recently
 dialled), `seeds` (parsed to `{ host, port }`), `user`, `password`,
 `consistency` (resolved to `0 | 1 | 2`), `connectTimeout`, `tls`, `tlsCa`,
-`tlsInsecure`, `tlsServerName`, `database`.
+`tlsInsecure`, `tlsServerName`, `tlsClientCert`, `tlsClientKey`,
+`authMechanism` (`'scram'` or `'certificate'`), `database`.
 
 ### `client.connect(): Promise<void>`
 
@@ -91,7 +97,7 @@ Placeholders are `$1, $2, …`. Rules:
   → epoch milliseconds, `Buffer` → hex string. Arrays and objects cannot be
   bound this way (`cannot bind value of type object`).
 
-### `client.batch(sql, rows): Promise<number>`
+### `client.batch(sql, rows, opts?): Promise<number>`
 
 `rows` is an array of parameter arrays for `$1, $2, …`. The statement is
 prepared once and executed once per row in a **single round-trip**; the
@@ -104,7 +110,7 @@ result is the total affected count.
 - Only preparable statements (`SELECT`/`INSERT`/`UPDATE`/`DELETE`, and
   `EXPLAIN` of those) can be batched; others reject with `statement cannot be
   prepared, so it cannot be batched`.
-- Uses the client's default consistency.
+- `opts = { consistency? }`; the default is the client's consistency.
 - The whole request must fit one 64 MiB frame; split very large batches.
 - `rows = []` resolves to `0` without a round-trip.
 
@@ -116,8 +122,12 @@ interpolate values yourself, or select by key with `query()`.
 
 - `client.stream.columns` holds the column names once the header has
   arrived. The slot is on the method, not the iterator, so it describes the
-  stream started most recently.
-- A non-row statement (INSERT, DDL, USE) yields nothing.
+  stream started most recently; so do `command` and `affected` below.
+- A non-row statement (INSERT, DDL, USE) yields nothing. Afterwards
+  `client.stream.command` is `'MUTATION'` or `'DDL'`,
+  `client.stream.affected` holds a mutation's affected-row count (`null`
+  otherwise) and `client.stream.columns` is `null`. A row result sets
+  `command` to `'SELECT'`.
 - An error before any row rejects like `query()` would. An error after some
   rows (a node dying mid-scan, a scan budget tripping) is thrown from the
   iteration after those rows, which are valid; the connection stays usable.

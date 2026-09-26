@@ -25,7 +25,7 @@ npm install @skaidb/client
 
 The package is `@skaidb/client` on the npm registry and is required as
 `@skaidb/client`. To install straight from GitHub instead, pin a tag with
-`npm install github:porcupin26/skaidb-node#v1.0.3` (`#main` follows the
+`npm install github:porcupin26/skaidb-node#v1.1.0` (`#main` follows the
 development branch); the module name is the same whatever the install
 source.
 
@@ -81,6 +81,8 @@ new Client({
 
   // TLS (see below).
   tls: false, tlsCa: undefined, tlsInsecure: false, tlsServerName: 'skaidb',
+  tlsClientCert: undefined, tlsClientKey: undefined,   // PEM paths; imply tls
+  authMechanism: 'scram',       // or 'certificate': log in with the client certificate
 });
 ```
 
@@ -111,6 +113,25 @@ it was talking to going away.
 new Client({ seeds, user, password, tlsCa: '/etc/skaidb/skai-ca.crt' });  // recommended
 ```
 
+### Client certificates and certificate login
+
+`tlsClientCert` / `tlsClientKey` (PEM file paths, given together) present a
+client certificate in the TLS handshake, which a server that verifies
+clients needs. Either implies `tls`. On its own the certificate only opens
+the TLS session; the login is still the SCRAM `user`/`password`.
+
+With `authMechanism: 'certificate'` the certificate **is** the login (wire
+mechanism EXTERNAL): the server maps its Common Name to a role and no
+password is sent. The server needs `auth.x509_enabled`, and its client CA
+must have signed the certificate. Pass `user` only to assert the expected
+identity: a certificate mapped to a different role fails the connect.
+
+```js
+new Client({ seeds, tlsCa: '/etc/skaidb/ca.crt',
+             tlsClientCert: '/etc/app/app.crt', tlsClientKey: '/etc/app/app.key',
+             authMechanism: 'certificate', database: 'app' });
+```
+
 ### Consistency
 
 `consistency` selects how many replicas must acknowledge a write or be
@@ -123,7 +144,7 @@ await client.query({ text: 'SELECT ...', consistency: 'ALL' });
 for await (const row of client.stream('SELECT ...', { consistency: 'ONE' })) { ... }
 ```
 
-`batch()` uses the client's level. The `CONSISTENCY` export holds the
+`batch(sql, rows, { consistency })` takes it per batch too. The `CONSISTENCY` export holds the
 numeric constants (`{ ONE: 0, QUORUM: 1, ALL: 2 }`).
 
 ## Queries
@@ -171,7 +192,7 @@ statements) fall back to safe client-side quoting of the same `$N`
 parameters, so every statement kind accepts parameters. Prepared ids are
 scoped to a connection and the cache is dropped on reconnect.
 
-### `client.batch(sql, rows)` — many rows, one round-trip
+### `client.batch(sql, rows, opts?)` — many rows, one round-trip
 
 ```js
 const n = await client.batch('INSERT INTO t (id, tags) VALUES ($1, $2)',
@@ -184,7 +205,8 @@ failing row the server answers with an error naming the row index and how
 many rows applied before it, and those earlier rows stay applied — so use
 idempotent statements. Only preparable statements (`SELECT`/`INSERT`/
 `UPDATE`/`DELETE`) can be batched; the whole request must fit one 64 MiB
-frame. An empty `rows` resolves to 0 without a round-trip.
+frame. An empty `rows` resolves to 0 without a round-trip. `opts` is
+`{ consistency }` (default: the client's).
 
 ### Multiple result sets
 
@@ -220,7 +242,11 @@ console.log(client.stream.columns);   // column names, set once the header arriv
 
 Options: `{ consistency, rowMode }`. It takes **no parameters** (the streaming
 opcode carries SQL text only). A non-row statement streamed this way yields
-nothing. An error before any row is an ordinary statement error; an error
+nothing; `client.stream.command` is then `'MUTATION'` or `'DDL'`,
+`client.stream.affected` holds a mutation's affected-row count and
+`client.stream.columns` is `null` (a row result sets `command` to
+`'SELECT'`). Like `columns`, these describe the stream started most
+recently. An error before any row is an ordinary statement error; an error
 partway through (a node dying mid-scan, a scan budget tripping) is thrown
 after the rows already yielded, which are valid.
 
@@ -323,7 +349,7 @@ Every error the driver raises is a `SkaidbError` (an `Error` subclass).
 
 Common messages: `connect failed: …`, `connect timeout`, `no reachable
 endpoint in …`, `authentication denied: …`, `server signature mismatch
-(mutual auth failed)`, `cannot read tlsCa …`, `server does not support
+(mutual auth failed)`, `cannot read tlsCa …`, `cannot read tlsClientCert …`, `server does not support
 streaming: …`, `statement expects N parameters, got M`, `no parameter for
 $N`, `cannot bind value of type …`, `cannot bind NaN/Infinity`, `bigint …
 does not fit a 64-bit integer`, `stream abandoned with too much data left to
@@ -336,7 +362,7 @@ drain`.
 | Null | `null` | `null`, `undefined` |
 | Bool | `boolean` | `boolean` |
 | Int (i64) | `number`, or `bigint` when outside ±2^53 | integer `number`, `bigint` |
-| Float | `number` | non-integer `number` (NaN/Infinity refused) |
+| Float | `number` | non-integer `number`, and `-0` (NaN/Infinity refused) |
 | Decimal | `string` (exact, e.g. `'123.45'`) | bind as `string` |
 | String | `string` | `string` |
 | Bytes | `Buffer` | `Buffer` |
@@ -362,10 +388,33 @@ arrays/objects cannot be bound at all.
   servers.
 - **Wire protocol**: <https://skaidb.org/docs/PROTOCOL.html>.
 
+## Conformance
+
+`test/conformance.test.js` runs the shared skaidb wire-protocol conformance
+suite, `conformance/vectors.json` (generated from the server's reference
+encoders; contract in [conformance/README.md](conformance/README.md)), as
+part of `npm test`:
+
+- every value vector decodes to the documented JavaScript form (above) and,
+  where JavaScript can bind that value, encodes to the reference bytes;
+- the SCRAM vectors against the driver's own SCRAM code;
+- a scripted fake server that verifies the client proof independently,
+  checks every request byte for byte and replays the reference responses,
+  for every case through the public API (`query`, `stream`, parameterized
+  `query`, `batch`), plus the auth outcomes (ok, a bad server signature
+  must fail, denied).
+
+Skipped: no call method. Encoding is not checked for the values JavaScript
+has no parameter form for: Decimal and Uuid (they surface as strings, which
+bind as String) and integral Floats such as `0.0` (an integer-valued
+`number` binds as Int). The vectors' `?` placeholders are given in this
+driver's `$1, $2, …` form, which it sends as `?`. CI fails when the vendored
+`conformance/vectors.json` differs from <https://skaidb.org/conformance/vectors.json>.
+
 ## Development
 
 ```sh
-npm test            # node:test unit tests, no server needed (~1 s)
+npm test            # node:test unit tests + conformance suite, no server needed (~3 s)
 npm run typecheck   # compiles test/types/consumer.ts against skaidb.d.ts
 npm run pack:check  # what a publish would ship
 node examples/basic.js host 7000 user password   # against a real node

@@ -26,6 +26,21 @@ jobs:
       - name: Package contents
         run: npm pack --dry-run
 
+  conformance-vectors:
+    name: Conformance vectors match the published copy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: conformance/vectors.json equals https://skaidb.org/conformance/vectors.json
+        run: |
+          curl -fsSL --retry 3 https://skaidb.org/conformance/vectors.json -o /tmp/published-vectors.json
+          if ! cmp -s /tmp/published-vectors.json conformance/vectors.json; then
+            echo "::error::conformance/vectors.json differs from https://skaidb.org/conformance/vectors.json; vendor the published copy byte-identical"
+            diff <(python3 -m json.tool /tmp/published-vectors.json) <(python3 -m json.tool conformance/vectors.json) | head -50 || true
+            exit 1
+          fi
+          echo "conformance/vectors.json matches the published copy"
+
   types:
     name: TypeScript declarations
     runs-on: ubuntu-latest

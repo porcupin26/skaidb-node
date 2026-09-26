@@ -6,6 +6,7 @@
 import {
   Client, Pool, SkaidbError, CONSISTENCY,
   ClientOptions, PoolOptions, QueryResult, QueryConfig, StreamEvent, Value, Consistency,
+  AuthMechanism, BatchOptions,
 } from '@skaidb/client';
 
 interface User { id: number; name: string; tags: string[] }
@@ -44,13 +45,20 @@ async function main(): Promise<void> {
   const affected: number = await client.batch(
     'INSERT INTO users (id, name, tags) VALUES ($1, $2, $3)',
     [[1, 'Ada', ['x']], [2, 'Linus', []]]);
+  const batchOpts: BatchOptions = { consistency: 'ALL' };
+  const affectedAll: number = await client.batch('DELETE FROM users WHERE id = $1', [[1]], batchOpts);
+  void affectedAll;
 
   // stream(): async iteration, options, columns slot.
   for await (const row of client.stream<User>('SELECT id, name, tags FROM users', { consistency: 'ONE' })) {
     const id: number = row.id;
     if (id > 10) break;                      // closing early is allowed; the driver drains
   }
-  const streamCols: string[] | undefined = client.stream.columns;
+  const streamCols: string[] | null | undefined = client.stream.columns;
+  for await (const _ of client.stream('DELETE FROM users WHERE id = 0')) { /* yields nothing */ }
+  const streamCommand: 'SELECT' | 'MUTATION' | 'DDL' | null | undefined = client.stream.command;
+  const streamAffected: number | bigint | null | undefined = client.stream.affected;
+  void [streamCommand, streamAffected];
   for await (const cells of client.stream<Value[]>('SELECT id FROM users', { rowMode: 'array' })) {
     void cells[0];
     break;
@@ -82,6 +90,20 @@ async function main(): Promise<void> {
   }
   // @ts-expect-error `after` takes an id string or null, not a number
   void client.subscribe('big_orders', { after: 0 });
+
+  // Certificate login: the TLS client certificate is the credential.
+  const mech: AuthMechanism = 'certificate';
+  const certOpts: ClientOptions = {
+    seeds: ['db1:7000'], tlsCa: '/etc/skaidb/ca.pem',
+    tlsClientCert: '/etc/app/app.crt', tlsClientKey: '/etc/app/app.key', authMechanism: mech,
+  };
+  const certClient = new Client(certOpts);
+  const certPath: string | null = certClient.tlsClientCert;
+  const keyPath: string | null = certClient.tlsClientKey;
+  const usedMech: AuthMechanism = certClient.authMechanism;
+  void [certPath, keyPath, usedMech];
+  // @ts-expect-error only 'scram' and 'certificate' are mechanisms
+  void new Client({ authMechanism: 'kerberos' });
 
   // Connection state and lifecycle.
   const usable: boolean = client.isUsable();

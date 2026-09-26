@@ -11,7 +11,7 @@ pass values).
 | Null | `null` | `null`, `undefined` |
 | Bool | `boolean` | `boolean` |
 | Int (64-bit) | `number` when within ±2^53, otherwise `bigint` | `number` with an integer value; any `bigint` that fits 64 bits |
-| Float (64-bit) | `number` | `number` with a fractional value (NaN and ±Infinity are refused) |
+| Float (64-bit) | `number` | `number` with a fractional value, and `-0` (NaN and ±Infinity are refused) |
 | Decimal | `string`, exact (`'123.45'`, `'-0.005'`) | bind a `string`; the driver has no Decimal encoder |
 | String | `string` | `string` |
 | Bytes | `Buffer` | `Buffer` |
@@ -25,7 +25,8 @@ Notes:
 - An `Int` beyond the safe integer range comes back as a `bigint` so no
   precision is lost; compare with `typeof v === 'bigint'` if you store ids
   near 2^63. To bind an Int that is not safely representable, pass a `bigint`.
-- A `number` such as `3` binds as Int and `3.5` as Float. To force Float for
+- A `number` such as `3` binds as Int and `3.5` as Float; `-0` binds as
+  Float `-0.0`, since Int has no negative zero. To force Float for
   an integral value, there is no marker; store the column as float and let
   the server convert, or bind `3.0` via a string cast in SQL.
 - A `Buffer` result is a copy; mutating it does not affect the driver.

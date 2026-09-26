@@ -4,6 +4,35 @@ All notable changes to the skaidb Node.js driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-09-26
+
+### Added
+- Certificate login: `authMechanism: 'certificate'` authenticates with the
+  TLS client certificate (wire mechanism EXTERNAL, PROTOCOL.md §2.4). The
+  certificate's Common Name is the username and no password is sent; `user`,
+  when given, asserts the expected identity.
+- `tlsClientCert` / `tlsClientKey` (PEM paths) present a client certificate
+  in the TLS handshake, for servers that verify clients; either implies TLS.
+- `client.stream.command` (`'SELECT'`, `'MUTATION'` or `'DDL'`) and
+  `client.stream.affected` (a mutation's affected-row count) describe a
+  streamed statement that yields no rows.
+- `batch(sql, rows, { consistency })`: a per-batch consistency level.
+- The shared skaidb wire-protocol conformance suite
+  (`conformance/vectors.json`, run by `test/conformance.test.js` as part of
+  `npm test`); CI fails when the vendored vectors differ from
+  <https://skaidb.org/conformance/vectors.json>.
+
+### Fixed
+- A streamed non-row statement (`UPDATE`, `DELETE`) gave no way to read its
+  affected-row count, and `client.stream.columns` kept the previous
+  stream's column names; it is now `null` for a statement without rows.
+  Found by the conformance suite.
+- A connect attempt that failed the handshake (denied, a server signature
+  mismatch, a protocol error) left its socket open: every failed seed or
+  retry leaked a connection. The socket is now closed and its unread frames
+  dropped before the next seed is tried.
+- `-0` was bound as Int `0`, losing its sign; it now binds as Float `-0.0`.
+
 ## [1.0.3] - 2026-09-20
 
 ### Changed

@@ -56,7 +56,7 @@ test('connect runs SCRAM, verifies the server signature and sends Hello with the
     assert.equal(srv.hellos.length, 1);
     assert.equal(srv.hellos[0].name, 'nodejs');
     assert.equal(srv.hellos[0].version, pkg.version);
-    assert.equal(pkg.version, '1.0.3');
+    assert.equal(pkg.version, '1.1.0');
     await c.end();
     assert.equal(c.isUsable(), false);
   });
@@ -69,6 +69,16 @@ test('a wrong password is denied; a forged server signature is refused', async (
     srv.corruptServerSignature = true;
     const d = new Client({ host: '127.0.0.1', port: srv.port, user: 'ada', password: 'secret' });
     await assert.rejects(d.connect(), /server signature mismatch/);
+  });
+});
+
+test('a failed handshake closes its socket instead of leaking an open connection', async () => {
+  await withServer({}, async (srv) => {
+    srv.corruptServerSignature = true;           // the server keeps the connection open
+    const c = new Client({ host: '127.0.0.1', port: srv.port, user: 'ada', password: 'secret' });
+    await assert.rejects(c.connect(), /server signature mismatch/);
+    await until(() => srv.sockets.size === 0);
+    assert.equal(c.isUsable(), false);
   });
 });
 
@@ -184,6 +194,7 @@ test('stream yields rows chunk by chunk, exposes columns, and ends cleanly', asy
     'SELECT boom': [F.header(['id']), F.chunk([[1]]), F.error('scan budget exceeded')],
     'SELECT early': F.error('no such table'),
     'CALL emits()': F.resultSets([[['a'], [[1]]]]),
+    'CREATE TABLE s (PRIMARY KEY (id))': F.ddl(),
   };
   await withServer({ handle: scripted(script) }, async (srv) => {
     const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
@@ -192,6 +203,8 @@ test('stream yields rows chunk by chunk, exposes columns, and ends cleanly', asy
     for await (const row of c.stream('SELECT id FROM big')) got.push(row);
     assert.deepEqual(got, [{ id: 1 }, { id: 2 }, { id: 3 }]);
     assert.deepEqual(c.stream.columns, ['id']);
+    assert.equal(c.stream.command, 'SELECT');
+    assert.equal(c.stream.affected, null);
     const arr = [];
     for await (const row of c.stream('SELECT id FROM big', { rowMode: 'array' })) arr.push(row);
     assert.deepEqual(arr, [[1], [2], [3]]);
@@ -199,9 +212,19 @@ test('stream yields rows chunk by chunk, exposes columns, and ends cleanly', asy
     const none = [];
     for await (const row of c.stream('INSERT INTO t VALUES (1)')) none.push(row);
     assert.deepEqual(none, []);
+    // ...and reports what it did: nothing stale from the previous stream.
+    assert.equal(c.stream.command, 'MUTATION');
+    assert.equal(c.stream.affected, 1);
+    assert.equal(c.stream.columns, null);
+    for await (const row of c.stream('CREATE TABLE s (PRIMARY KEY (id))')) none.push(row);
+    assert.deepEqual(none, []);
+    assert.equal(c.stream.command, 'DDL');
+    assert.equal(c.stream.affected, null);
     assert.deepEqual((await c.query('SELECT id FROM t')).rows, [{ id: 9 }]);
     // Error before the header: a plain statement failure.
     await assert.rejects((async () => { for await (const _ of c.stream('SELECT early')) {} })(), /no such table/);
+    assert.equal(c.stream.columns, null);
+    assert.equal(c.stream.command, null);
     // Error after the header: rows so far are valid, the stream ends, connection is fine.
     const partial = [];
     await assert.rejects((async () => { for await (const r of c.stream('SELECT boom')) partial.push(r); })(),
@@ -296,6 +319,11 @@ test('batch sends one OP_EXECUTE_BATCH with typed rows and returns the total', a
     assert.equal(batches[0].sql, 'INSERT INTO t (id, tags) VALUES (?, ?)');
     assert.equal(batches[0].req.consistency, 2);
     assert.deepEqual(batches[0].req.rows, rows);
+    // A per-batch consistency overrides the client's.
+    assert.equal(await c.batch('INSERT INTO t (id, tags) VALUES ($1, $2)', rows, { consistency: 'ONE' }), 3);
+    assert.equal(batches[1].req.consistency, 0);
+    assert.throws(() => c.batch('INSERT INTO t (id, tags) VALUES ($1, $2)', rows, { consistency: 'SOME' }),
+      /bad consistency/);
     assert.equal(await c.batch('INSERT INTO t (id, tags) VALUES ($1, $2)', []), 0);
     await assert.rejects(c.batch('INSERT INTO t (id, tags) VALUES ($1, $2)', [[1, ['a']], [2]]), /no parameter for \$2/);
     await assert.rejects(c.batch('CREATE TABLE x (PRIMARY KEY (id))', [[1]]), /cannot be prepared/);

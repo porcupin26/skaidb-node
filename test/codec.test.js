@@ -25,6 +25,14 @@ test('integers travel as Int (tag 2), non-integers as Float (tag 3)', () => {
   assert.equal(I.encodeValue(7).readBigInt64LE(1), 7n);
 });
 
+test('-0 binds as Float -0.0, keeping its sign (Int 0 has none)', () => {
+  const b = I.encodeValue(-0);
+  assert.equal(b[0], 3);
+  assert.equal(b.subarray(1).toString('hex'), '0000000000000080');
+  assert.ok(Object.is(roundtrip(-0), -0));
+  assert.equal(I.encodeValue(0)[0], 2);
+});
+
 test('ints beyond 2^53 decode as bigint, safe ones as number', () => {
   const big = 2n ** 62n + 1n;
   assert.equal(roundtrip(big), big);

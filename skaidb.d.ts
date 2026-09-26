@@ -20,6 +20,13 @@ export type Value =
   | Value[]
   | { [key: string]: Value };
 
+/**
+ * How the client logs in. `'scram'` (default): SCRAM-SHA-256 with
+ * `user`/`password`. `'certificate'`: the TLS client certificate is the
+ * credential (wire mechanism EXTERNAL) and its Common Name the username.
+ */
+export type AuthMechanism = "scram" | "certificate";
+
 /** A `host:port` seed, or a bare host that takes the client's `port`. */
 export type Seed = string;
 
@@ -34,7 +41,11 @@ export interface ClientOptions {
    * connects AND authenticates wins. Overrides `host`/`port`.
    */
   seeds?: Seed[];
-  /** User name. Default `anonymous`. */
+  /**
+   * User name. Default `anonymous`. With `authMechanism: 'certificate'` it
+   * only asserts the identity (it must equal the certificate's CN) and
+   * defaults to empty.
+   */
   user?: string;
   /** Password. Empty for anonymous connections. */
   password?: string;
@@ -50,6 +61,18 @@ export interface ClientOptions {
   tlsInsecure?: boolean;
   /** SNI name; must match a SAN on the server certificate. Default `skaidb`. */
   tlsServerName?: string;
+  /**
+   * Path to a PEM client certificate presented in the TLS handshake. Needs
+   * `tlsClientKey`; implies `tls`.
+   */
+  tlsClientCert?: string;
+  /** Path to the PEM private key of `tlsClientCert`. */
+  tlsClientKey?: string;
+  /**
+   * `'certificate'` logs in with the client certificate instead of a
+   * password (requires `tlsClientCert`/`tlsClientKey`). Default `'scram'`.
+   */
+  authMechanism?: AuthMechanism;
   /** Session database, selected with `USE` right after the handshake (and after every reconnect). */
   database?: string;
 }
@@ -94,14 +117,24 @@ export interface StreamOptions {
   rowMode?: RowMode;
 }
 
+export interface BatchOptions {
+  /** Consistency for this batch only. Default: the client's. */
+  consistency?: Consistency;
+}
+
 /**
  * `client.stream(sql)` — an async generator over the rows of one statement.
- * `columns` is filled once the header arrives and describes the stream
- * started MOST RECENTLY (the slot lives on the method, not the iterator).
+ * The slots below describe the stream started MOST RECENTLY (they live on
+ * the method, not the iterator).
  */
 export interface StreamFunction {
   <Row = any>(sql: string, opts?: StreamOptions): AsyncGenerator<Row, void, undefined>;
-  columns?: string[];
+  /** Column names once the header arrives; `null` for a statement without rows. */
+  columns?: string[] | null;
+  /** `'SELECT'` for rows, `'MUTATION'` or `'DDL'` for a statement that yields none. */
+  command?: "SELECT" | "MUTATION" | "DDL" | null;
+  /** A mutation's affected-row count; `null` otherwise. */
+  affected?: number | bigint | null;
 }
 
 /** One event from a `CREATE STREAM` log, as yielded by `subscribe()`. */
@@ -151,6 +184,9 @@ export class Client {
   tlsCa: string | null;
   tlsInsecure: boolean;
   tlsServerName: string;
+  tlsClientCert: string | null;
+  tlsClientKey: string | null;
+  authMechanism: AuthMechanism;
   database: string | null;
 
   /**
@@ -172,7 +208,7 @@ export class Client {
    * affected count. Rows autocommit individually; the statement must be
    * preparable (SELECT/INSERT/UPDATE/DELETE) and idempotent.
    */
-  batch(sql: string, rows: Value[][]): Promise<number>;
+  batch(sql: string, rows: Value[][], opts?: BatchOptions): Promise<number>;
 
   /**
    * Stream a result set row by row while holding one chunk in memory. The

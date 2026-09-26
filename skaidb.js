@@ -190,7 +190,9 @@ function encodeInto(v, parts) {
     parts.push(Buffer.from([2]), b); return;
   }
   if (typeof v === 'number') {
-    if (Number.isInteger(v)) {
+    // -0 is an integer to JS but has no Int form: binding it as Int 0
+    // would lose the sign, so it travels as the Float it is.
+    if (Number.isInteger(v) && !Object.is(v, -0)) {
       const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(v), 0);
       parts.push(Buffer.from([2]), b); return;
     }
@@ -275,7 +277,18 @@ class Client {
           ? { host: String(s).slice(0, i), port: Number(String(s).slice(i + 1)) }
           : { host: String(s), port: this.port };
       });
-    this.user = opts.user || 'anonymous';
+    // Certificate login (wire mechanism EXTERNAL): the TLS client
+    // certificate IS the credential and its Common Name the username, so
+    // no password is sent. `user`, when given, only asserts the identity
+    // (the server refuses a certificate mapped to a different role); left
+    // out, the username is sent empty.
+    const mech = String(opts.authMechanism === undefined ? 'scram' : opts.authMechanism).toLowerCase();
+    if (!['scram', 'password', 'certificate', 'external', 'x509'].includes(mech)) {
+      throw new SkaidbError(
+        `unknown authMechanism ${opts.authMechanism} (use 'scram' or 'certificate')`);
+    }
+    this.authMechanism = ['certificate', 'external', 'x509'].includes(mech) ? 'certificate' : 'scram';
+    this.user = opts.user || (this.authMechanism === 'certificate' ? '' : 'anonymous');
     this.password = opts.password || '';
     this.consistency = resolveConsistency(opts.consistency);
     this.connectTimeout = opts.connectTimeout || 10000;
@@ -284,7 +297,20 @@ class Client {
     // options turns it on: tls, tlsCa, or tlsInsecure.
     this.tlsCa = opts.tlsCa || null;
     this.tlsInsecure = opts.tlsInsecure === true;
-    this.tls = opts.tls === true || this.tlsCa !== null || this.tlsInsecure;
+    // A client certificate (PEM paths) presented in the TLS handshake: what
+    // a server that verifies clients needs, and the credential itself with
+    // authMechanism 'certificate'. Either implies TLS.
+    this.tlsClientCert = opts.tlsClientCert || null;
+    this.tlsClientKey = opts.tlsClientKey || null;
+    if ((this.tlsClientCert === null) !== (this.tlsClientKey === null)) {
+      throw new SkaidbError('tlsClientCert and tlsClientKey go together');
+    }
+    if (this.authMechanism === 'certificate' && this.tlsClientCert === null) {
+      throw new SkaidbError(
+        "authMechanism 'certificate' needs a client certificate (tlsClientCert and tlsClientKey)");
+    }
+    this.tls = opts.tls === true || this.tlsCa !== null || this.tlsInsecure
+      || this.tlsClientCert !== null;
     // SNI must match a SAN on the server certificate, which is usually not
     // the address you dialled — skaidb's own certs carry DNS:skaidb.
     this.tlsServerName = opts.tlsServerName || 'skaidb';
@@ -348,6 +374,20 @@ class Client {
             return;
           }
         }
+        if (this.tlsClientCert) {
+          try {
+            opts.cert = fs.readFileSync(this.tlsClientCert);
+          } catch (e) {
+            reject(new SkaidbError(`cannot read tlsClientCert ${this.tlsClientCert}: ${e.message}`));
+            return;
+          }
+          try {
+            opts.key = fs.readFileSync(this.tlsClientKey);
+          } catch (e) {
+            reject(new SkaidbError(`cannot read tlsClientKey ${this.tlsClientKey}: ${e.message}`));
+            return;
+          }
+        }
         sock = tls.connect(opts);
         ready = 'secureConnect';       // fires only after the TLS handshake
       } else {
@@ -383,7 +423,20 @@ class Client {
             ? this._doQuery(`USE "${this.database.replace(/"/g, '""')}"`, this.consistency, 'object')
                 .then(() => undefined)
             : undefined)
-          .then(resolve, reject);
+          .then(resolve, (e) => {
+            // A seed that fails the handshake (denied, a bad signature, a
+            // protocol error) must not keep its socket: close it and drop
+            // anything it left unread, so the next seed starts clean.
+            // Without this every failed attempt leaked an open connection.
+            if (this._sock === sock) {
+              this._sock = null;
+              this._buf = Buffer.alloc(0);
+              this._frames = [];
+              this._waiters = [];
+            }
+            sock.destroy();
+            reject(e);
+          });
       });
     });
   }
@@ -512,8 +565,9 @@ class Client {
   }
 
   async _handshake() {
+    if (this.authMechanism === 'certificate') return this._handshakeCertificate();
     const clientNonce = `js${process.pid}.${nonceCounter++}`;
-    this._writeFrame(Buffer.concat([Buffer.from([10]), encStr(this.user), encStr(clientNonce)]));
+    this._writeFrame(authStartFrame(this.user, clientNonce));
 
     const r1 = new Reader(await this._readFrame());
     if (r1.u8() !== 11) throw new SkaidbError('bad handshake challenge');
@@ -524,27 +578,28 @@ class Client {
     const authMessage = Buffer.from(
       [this.user, clientNonce, serverNonce, salt.toString('hex'), String(iterations)].join('\0'),
       'utf8');
-    const salted = crypto.pbkdf2Sync(this.password, salt, iterations, 32, 'sha256');
-    const clientKey = hmac(salted, Buffer.from('Client Key'));
-    const storedKey = sha256(clientKey);
-    const clientSig = hmac(storedKey, authMessage);
-    const proof = xor(clientKey, clientSig);
+    const { proof, serverSignature } = scramProof(this.password, salt, iterations, authMessage);
 
     this._writeFrame(Buffer.concat([Buffer.from([12]), proof]));
 
-    const r2 = new Reader(await this._readFrame());
-    if (r2.u8() !== 13) throw new SkaidbError('bad handshake outcome');
-    if (r2.u8() === 1) {
-      const serverSig = r2.take(32);
-      if (this.password) {
-        const serverKey = hmac(salted, Buffer.from('Server Key'));
-        const expected = hmac(serverKey, authMessage);
-        if (!crypto.timingSafeEqual(serverSig, expected))
-          throw new SkaidbError('server signature mismatch (mutual auth failed)');
-      }
-    } else {
-      throw new SkaidbError(`authentication denied: ${r2.text()}`);
+    const serverSig = parseAuthOutcome(await this._readFrame());
+    if (this.password && !crypto.timingSafeEqual(serverSig, serverSignature))
+      throw new SkaidbError('server signature mismatch (mutual auth failed)');
+  }
+
+  /**
+   * EXTERNAL: the TLS client certificate is the credential. AuthStart
+   * carries the (possibly empty) username, an empty nonce and mechanism 2;
+   * the server answers AuthOutcome at once. The outcome's signature is 32
+   * zero bytes and is deliberately NOT verified: TLS authenticated the
+   * server.
+   */
+  async _handshakeCertificate() {
+    if (!this.tls || !this.tlsClientCert) {
+      throw new SkaidbError('certificate authentication needs TLS with a client certificate');
     }
+    this._writeFrame(authStartFrame(this.user, '', AUTH_MECHANISM.EXTERNAL));
+    parseAuthOutcome(await this._readFrame());
   }
 
   // pg-style: query(text, [params]) or query({ text, values, consistency, rowMode })
@@ -596,10 +651,13 @@ class Client {
    *   for await (const row of client.stream('SELECT ...')) { ... }
    *
    * Column names land on `client.stream.columns` once the header arrives.
-   * That slot lives on the shared method, not on the iterator, so it
-   * describes whichever stream started most recently — read it before
-   * starting another. Takes no parameters: the streaming opcode carries SQL
-   * text.
+   * A statement that produces no rows (UPDATE, DELETE, DDL) yields nothing;
+   * `client.stream.command` then says `'MUTATION'` or `'DDL'` and
+   * `client.stream.affected` holds a mutation's affected-row count
+   * (`columns` is null). A row result sets `command` to `'SELECT'`. Those
+   * slots live on the shared method, not on the iterator, so they describe
+   * whichever stream started most recently — read them before starting
+   * another. Takes no parameters: the streaming opcode carries SQL text.
    *
    * The connection is busy for the whole stream, and CLOSING the iterator is
    * what frees it. `break`, `return`, a throw out of the loop body and an
@@ -632,6 +690,11 @@ class Client {
       // query() does. Without this the request goes into a dead socket and
       // the reply never comes.
       await this._ensureLive();
+      // This stream now owns the result slots: nothing stale from the
+      // previous stream may describe it (a mutation has no columns).
+      this.stream.columns = null;
+      this.stream.command = null;
+      this.stream.affected = null;
       const body = Buffer.from(sql, 'utf8');
       const head = Buffer.allocUnsafe(6);
       head[0] = 5; head[1] = consistency; head.writeUInt32LE(body.length, 2);
@@ -644,13 +707,19 @@ class Client {
         throw new SkaidbError(msg.includes('unknown opcode')
           ? `server does not support streaming: ${msg}` : msg);
       }
-      if (tag === 1 || tag === 2) return;      // mutation/ddl: no rows
+      if (tag === 1) {                         // mutation: no rows, a count
+        this.stream.command = 'MUTATION';
+        this.stream.affected = safeInt(first.u64());
+        return;
+      }
+      if (tag === 2) { this.stream.command = 'DDL'; return; }
       if (tag !== 5) throw this._desync(`unexpected response tag ${tag} to stream request`);
       streaming = true;
       const ncols = first.u32();
       const fields = [];
       for (let i = 0; i < ncols; i++) fields.push(first.text());
       this.stream.columns = fields;
+      this.stream.command = 'SELECT';
       for (;;) {
         const r = new Reader(await this._readFrame());
         const t = r.u8();
@@ -713,8 +782,12 @@ class Client {
    * Execute `sql` once per row in ONE round-trip. Rows autocommit
    * individually: a failure names the row and earlier rows stay applied, so
    * the statement must be idempotent. Returns the total affected count.
+   * `opts.consistency` sets the level for this batch only (default: the
+   * client's).
    */
-  batch(sql, rows) {
+  batch(sql, rows, opts = {}) {
+    const consistency = opts.consistency === undefined
+      ? this.consistency : resolveConsistency(opts.consistency);
     const run = this._queryChain.then(async () => {
       // Recover a transport that died since the last statement, BEFORE
       // anything is prepared on it (a stale statement id is the hazard).
@@ -730,7 +803,7 @@ class Client {
         }
       }
       const head = Buffer.allocUnsafe(10);
-      head[0] = 7; head[1] = this.consistency;
+      head[0] = 7; head[1] = consistency;
       head.writeUInt32LE(p.id, 2); head.writeUInt32LE(ordered.length, 6);
       const parts = [head];
       for (const r of ordered) {
@@ -950,6 +1023,41 @@ function encStr(s) {
   return Buffer.concat([head, b]);
 }
 function hmac(key, msg) { return crypto.createHmac('sha256', key).update(msg).digest(); }
+
+// AuthStart's optional trailing mechanism byte (§2.4).
+const AUTH_MECHANISM = { SCRAM: 0, GSSAPI: 1, EXTERNAL: 2 };
+
+/**
+ * AuthStart (tag 10). With no mechanism the byte is omitted, which every
+ * server reads as SCRAM-SHA-256.
+ */
+function authStartFrame(user, clientNonce, mechanism) {
+  const parts = [Buffer.from([10]), encStr(user), encStr(clientNonce)];
+  if (mechanism !== undefined) parts.push(Buffer.from([mechanism]));
+  return Buffer.concat(parts);
+}
+
+/**
+ * AuthOutcome (tag 13): returns the 32-byte server signature of an Ok, and
+ * throws with the server's reason for a Denied.
+ */
+function parseAuthOutcome(payload) {
+  const r = new Reader(payload);
+  if (r.u8() !== 13) throw new SkaidbError('bad handshake outcome');
+  if (r.u8() !== 1) throw new SkaidbError(`authentication denied: ${r.text()}`);
+  return Buffer.from(r.take(32));
+}
+
+/** SCRAM-SHA-256 (§2.1): the client proof and the expected server signature. */
+function scramProof(password, salt, iterations, authMessage) {
+  const salted = crypto.pbkdf2Sync(Buffer.from(password, 'utf8'), salt, iterations, 32, 'sha256');
+  const clientKey = hmac(salted, Buffer.from('Client Key'));
+  const storedKey = sha256(clientKey);
+  const proof = xor(clientKey, hmac(storedKey, authMessage));
+  const serverSignature = hmac(hmac(salted, Buffer.from('Server Key')), authMessage);
+  return { salted, proof, serverSignature };
+}
+
 function sha256(b) { return crypto.createHash('sha256').update(b).digest(); }
 function xor(a, b) { const o = Buffer.allocUnsafe(a.length); for (let i = 0; i < a.length; i++) o[i] = a[i] ^ b[i]; return o; }
 
@@ -1028,5 +1136,5 @@ module.exports = { Client, Pool, SkaidbError, CONSISTENCY };
 module.exports._internal = {
   Reader, decodeValue, encodeValue, bindParams, toQmark, quote,
   decimalToString, formatUuid, encStr, u32le, resolveConsistency,
-  DRAIN_BUDGET_BYTES,
+  DRAIN_BUDGET_BYTES, AUTH_MECHANISM, authStartFrame, parseAuthOutcome, scramProof,
 };
