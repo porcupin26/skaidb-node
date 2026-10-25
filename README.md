@@ -379,6 +379,12 @@ everything follows the latest writer — pass a key when you balance. A
 statement is a write unless its first keyword is `SELECT`, `SHOW`,
 `EXPLAIN`, `DESCRIBE`/`DESC`, `VALUES`, `WITH` or `USE`.
 
+Derive the key without touching the pool: if it comes from something that
+itself queries the database through the same pool (a web framework's
+"current user" loader), a helper that checks out a connection and computes
+the key inside it re-enters itself. Read the raw id from the session or
+token instead.
+
 **Watching it.** `pool.members()` returns one entry per member, in endpoint
 order:
 
