@@ -56,7 +56,7 @@ test('connect runs SCRAM, verifies the server signature and sends Hello with the
     assert.equal(srv.hellos.length, 1);
     assert.equal(srv.hellos[0].name, 'nodejs');
     assert.equal(srv.hellos[0].version, pkg.version);
-    assert.equal(pkg.version, '1.1.0');
+    assert.equal(pkg.version, '1.2.0');
     await c.end();
     assert.equal(c.isUsable(), false);
   });
@@ -343,6 +343,22 @@ test('seeds: a dead endpoint is skipped, a live one wins', async () => {
     await c.end();
     const d = new Client({ seeds: [`127.0.0.1:${deadPort}`], password: 'secret', connectTimeout: 500 });
     await assert.rejects(d.connect(), /no reachable endpoint in 127\.0\.0\.1:\d+: connect failed/);
+  });
+});
+
+test('seeds: one that closes the connection mid-handshake does not fail the rest of the walk', async () => {
+  await withServer({}, async (bad) => {
+    bad.refuse = true;                                        // accepts TCP, then hangs up
+    await withServer({}, async (srv) => {
+      // Shuffled per connect: over ten tries the refusing seed comes first
+      // in all but a 1-in-1024 run, and the next seed must still win.
+      for (let i = 0; i < 10; i++) {
+        const c = new Client({ seeds: [`127.0.0.1:${bad.port}`, `127.0.0.1:${srv.port}`], password: 'secret' });
+        await c.connect();
+        assert.equal(c.port, srv.port);
+        await c.end();
+      }
+    });
   });
 });
 

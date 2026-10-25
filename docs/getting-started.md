@@ -15,7 +15,7 @@ npm install @skaidb/client
 ```
 
 The package is `@skaidb/client`, so it is required as `@skaidb/client`. To
-install from GitHub instead, `npm install github:porcupin26/skaidb-node#v1.1.0`
+install from GitHub instead, `npm install github:porcupin26/skaidb-node#v1.2.0`
 pins a tag and `#main` follows the development branch; the module name is
 the same either way.
 
@@ -97,6 +97,17 @@ const res = await pool.withConnection((c) => c.query('SELECT count(*) AS n FROM 
 
 await pool.end();
 ```
+
+To spread one process's connections evenly over the cluster, pick a policy
+and let the pool learn the members:
+
+```js
+const pool = new Pool({ seeds: ['db1:7000'], user, password,
+                        loadBalancing: 'least_latency', discover: true });
+```
+
+It skips members that are resyncing, ejects ones that fail or turn slow and
+probes them back in. See [the pool reference](api.md#new-pooloptions).
 
 ## Big results
 

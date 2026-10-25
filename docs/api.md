@@ -200,20 +200,80 @@ dropped rather than reused misaligned.
 
 ## `new Pool(options?)`
 
-All `Client` options plus `maxsize` (default `10`, must be ≥ 1): the number
-of connections kept **idle**. Checking out beyond it opens extra connections;
-the surplus is closed when released.
+All `Client` options plus the pool's own. `seeds` (or `host`/`port`) name
+the starting members; the other `Client` options apply to every connection.
+An unknown `loadBalancing` or `idleOrder`, `maxsize < 1` or
+`ejectErrors < 1` throws a `SkaidbError`.
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `maxsize` | `number` | `10` | Connections kept **idle**. Checking out beyond it opens extra connections; the surplus is closed when released. |
+| `loadBalancing` | `'random' \| 'round_robin' \| 'least_latency'` | `'random'` | `'random'`: any idle connection; a new one dials the usable members in random order. `'round_robin'`: the next usable member in endpoint order. `'least_latency'`: of two usable members picked at random, the one with the lower `latency × (checked-out + 1)`; a member not measured, or not in the last 2 s, scores 0. |
+| `idleOrder` | `'lifo' \| 'fifo'` | `'lifo'` | The most recently returned idle connection first, or the longest idle. |
+| `discover` | `boolean` | `false` | Members from `SHOW ENDPOINTS` (server ≥ 0.327) on the first connection to each member and every `refreshInterval` after (every 5 s while one is `resyncing`/`unreachable`). |
+| `refreshInterval` | `number` (ms) | `60000` | Between discovery refreshes. |
+| `readYourWrites` | `number` (ms) | `0` (off) | After a write, checkouts with the same `affinity` go to the member that took it for this long. |
+| `ejectErrors` | `number` | `3` | Consecutive transport failures that eject a member. |
+| `ejectLatencyFactor` | `number` | `3` | Eject a member whose average is above this × the other usable members' median (`0` disables)… |
+| `ejectLatencyFloor` | `number` (ms) | `50` | …and more than this above it. |
+| `ejectBackoff` | `number` (ms) | `5000` | How long an ejection lasts, doubled per repeat. |
+| `ejectBackoffMax` | `number` (ms) | `60000` | The backoff's cap; a member healthy this long after a re-admission starts over at `ejectBackoff`. |
 
 | Member | Meaning |
 |---|---|
-| `pool.acquire(): Promise<Client>` | An idle connection validated with `isUsable()` (a dead one is discarded and the next tried), or a freshly connected one. Rejects with `pool is closed` after `end()`. |
-| `pool.release(conn): Promise<void>` | Returns a connection; closes it instead when it is broken, the pool is closed, or `maxsize` idle connections already exist. |
-| `pool.withConnection(fn): Promise<T>` | `acquire()`, run `fn(conn)`, `release()` however `fn` ends. |
-| `pool.end(): Promise<void>` | Closes every idle connection; checked-out ones close on release. |
+| `pool.acquire(options?): Promise<Client>` | An idle connection to the member the policy picks, validated with `isUsable()` (a dead one is discarded and the next tried), or one freshly dialed to it — a failed dial falls through to the other usable members, then to the unusable ones. `options.affinity` (any value; a user or session id) scopes `readYourWrites`; without it checkouts share one pool-wide key. Rejects with `pool is closed` after `end()`, and with `no reachable endpoint in …` when no member can be dialed. |
+| `pool.release(conn): Promise<void>` | Returns a connection; closes it instead when it is broken, its member is ejected, not `ready` or gone, the pool is closed, or `maxsize` idle connections already exist. |
+| `pool.withConnection(fn)` · `pool.withConnection(options, fn)`: `Promise<T>` | `acquire(options)`, run `fn(conn)`, `release()` however `fn` ends. |
+| `pool.members(): PoolMember[]` | One entry per member, in endpoint order: `endpoint` (what the pool dials), `canonical` (the member's own name once discovered, else `null`), `state` (`'ready'`, `'ejected'`, `'resyncing'`, `'unreachable'`, `'unlisted'`), `latencyMs` (round-trip average, `null` until measured), `inUse`, `idle`, `seed`. |
+| `pool.end(): Promise<void>` | Closes every idle connection and stops the probe/discovery timer; checked-out ones close on release. |
 | `pool.maxsize`, `pool.closed` | The configured bound; whether `end()` was called. |
 
+`Pool` is an `EventEmitter`. It emits `'eject'` with `{ endpoint, reason }`
+when it takes a member out of rotation and `'readmit'` with `{ endpoint }`
+when a probe lets it back in. Listeners run on a later tick.
+
+### How the pool balances
+
+The rules are shared by every skaidb driver
+([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)):
+
+- **Latency.** Per member, an exponentially weighted average of request
+  round trips (send to the first response frame): each sample moves it 5 %
+  of the way, no sample counts for more than 10 × the larger of the average
+  and `ejectLatencyFloor`, and the first sample sets it.
+- **Ejection.** A member is ejected — no new connections, its idle ones
+  closed — after `ejectErrors` consecutive transport failures (a failed
+  dial, an I/O error mid-request, a capacity refusal; not a statement error
+  or a login refused for its credentials), or when, with at least 10
+  samples on it and on another usable member, its average is above
+  `ejectLatencyFactor` × the median of the other usable members' averages
+  (the lower middle when even) and more than `ejectLatencyFloor` above it.
+  The last usable member is never ejected.
+- **Re-admission.** When the backoff is up, a background timer
+  (`unref()`'d, so it never keeps the process alive) dials the member alone
+  and runs `SHOW DATABASES`: success re-admits it with a fresh average and
+  its errors cleared, and the probe connection joins the idle set; failure
+  ejects it again for twice as long. The pool's own statements (the probe,
+  `SHOW ENDPOINTS`) give up after `connectTimeout`.
+- **Discovery.** A listed endpoint the pool does not know becomes a member;
+  a discovered member missing from a later listing is dropped; a seed is
+  never dropped (a seed whose member left the ring is `unlisted`), and a
+  seed given as a host name is matched to the endpoint the server reports
+  rather than counted twice. A member that turns `ready` again starts with a
+  fresh latency average. A server that answers `SHOW ENDPOINTS` with an
+  error (older than the statement) or with no rows (a standalone server)
+  turns discovery off and the seeds stay as they are.
+- **Read-your-writes.** A statement counts as a write unless its first
+  keyword (after whitespace, comments and opening parentheses) is `SELECT`,
+  `SHOW`, `EXPLAIN`, `DESCRIBE`, `DESC`, `VALUES`, `WITH` or `USE`. After a
+  write succeeds on a connection checked out under a key, checkouts under
+  that key go to the same member until the window ends, unless it is
+  ejected or not `ready`.
+
 A connection checked out with `acquire()` is an ordinary `Client`: the same
-serialization, streaming and reconnect rules apply.
+serialization, streaming and reconnect rules apply — except that a pooled
+connection re-dials in the pool's order (usable members first, the one it
+just lost last) instead of walking the shuffled seeds.
 
 ## `SkaidbError`
 

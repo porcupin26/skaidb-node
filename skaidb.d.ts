@@ -5,6 +5,8 @@
 
 /// <reference types="node" />
 
+import { EventEmitter } from "events";
+
 /** A consistency level, by number or by name (case-insensitive at runtime). */
 export type Consistency = 0 | 1 | 2 | "ONE" | "QUORUM" | "ALL" | "one" | "quorum" | "all";
 
@@ -233,28 +235,124 @@ export class Client {
   end(): Promise<void>;
 }
 
+/**
+ * Where a checkout goes. `'random'` (default): any idle connection, and a
+ * new connection dials the usable members in random order. `'round_robin'`:
+ * the next usable member in endpoint order. `'least_latency'`: of two usable
+ * members picked at random, the one with the lower round-trip average ×
+ * (checked-out connections + 1).
+ */
+export type LoadBalancing = "random" | "round_robin" | "least_latency";
+
+/** Which idle connection a checkout reuses: the most recently returned (`'lifo'`) or the longest idle (`'fifo'`). */
+export type IdleOrder = "lifo" | "fifo";
+
+/** A member's state as the pool sees it. Only `ready` members get new connections. */
+export type MemberState = "ready" | "ejected" | "resyncing" | "unreachable" | "unlisted";
+
 export interface PoolOptions extends ClientOptions {
   /** Connections kept IDLE (not a cap on checked-out ones). Default `10`. */
   maxsize?: number;
+  /** How checkouts spread over the members. Default `'random'`. */
+  loadBalancing?: LoadBalancing;
+  /** Default `'lifo'`; `'fifo'` keeps every idle connection in use. */
+  idleOrder?: IdleOrder;
+  /**
+   * Learn the members from `SHOW ENDPOINTS` (server ≥ 0.327) when a member
+   * is first reached and every `refreshInterval` after (every 5 s while one
+   * is `resyncing` or `unreachable`). Default `false`.
+   */
+  discover?: boolean;
+  /** Milliseconds between discovery refreshes. Default `60000`. */
+  refreshInterval?: number;
+  /**
+   * Milliseconds after a write during which checkouts with the same
+   * `affinity` go to the member that took it. Default `0` (off).
+   */
+  readYourWrites?: number;
+  /** Consecutive transport failures that eject a member. Default `3`. */
+  ejectErrors?: number;
+  /** Eject a member whose latency average is above this × the others' median. Default `3`; `0` disables. */
+  ejectLatencyFactor?: number;
+  /** …and more than this many milliseconds above it. Default `50`. */
+  ejectLatencyFloor?: number;
+  /** Milliseconds an ejection lasts, doubled per repeat. Default `5000`. */
+  ejectBackoff?: number;
+  /** Cap on the doubled backoff, in milliseconds. Default `60000`. */
+  ejectBackoffMax?: number;
+}
+
+export interface AcquireOptions {
+  /**
+   * Read-your-writes scope — a user id, a session id. With `readYourWrites`
+   * set, checkouts under the same key follow the member that took the key's
+   * last write. Left out, checkouts share one pool-wide key.
+   */
+  affinity?: unknown;
+}
+
+/** One member as `pool.members()` reports it. */
+export interface PoolMember {
+  /** The endpoint the pool dials, `host:port`. */
+  endpoint: string;
+  /** The member's own name from `SHOW ENDPOINTS`, once discovered. */
+  canonical: string | null;
+  state: MemberState;
+  /** Round-trip average in milliseconds; `null` until measured. */
+  latencyMs: number | null;
+  /** Connections checked out to it. */
+  inUse: number;
+  /** Idle connections to it. */
+  idle: number;
+  /** Whether it was configured (a seed is never dropped by discovery). */
+  seed: boolean;
+}
+
+/** Payload of the pool's `'eject'` event. */
+export interface EjectEvent {
+  endpoint: string;
+  /** Why: consecutive failures, or its latency against the median. */
+  reason: string;
+}
+
+/** Payload of the pool's `'readmit'` event. */
+export interface ReadmitEvent {
+  endpoint: string;
 }
 
 /**
- * A pool of connections. Every `ClientOptions` field passes through, so
- * pooled connections inherit seeds, TLS, consistency and the database.
+ * A pool of connections balanced across the cluster's members. Every
+ * `ClientOptions` field passes through, so pooled connections inherit TLS,
+ * consistency and the database; `seeds` (or `host`/`port`) name the
+ * starting members. Emits `'eject'` and `'readmit'` as members leave and
+ * rejoin the rotation.
  */
-export class Pool {
+export class Pool extends EventEmitter {
   constructor(options?: PoolOptions);
   readonly maxsize: number;
   /** True after `end()`. */
   readonly closed: boolean;
-  /** Check out a usable connection, opening a fresh one when none is idle. */
-  acquire(): Promise<Client>;
-  /** Return a connection; it is closed instead if broken or the pool is full. */
+  /**
+   * Check out a usable connection: an idle one to the member the policy
+   * picks, or a new one dialed to it (falling back to the other members).
+   */
+  acquire(options?: AcquireOptions): Promise<Client>;
+  /** Return a connection; it is closed instead if broken, its member is not usable, or the pool is full. */
   release(conn: Client): Promise<void>;
   /** Run `fn` with a checked-out connection and return it however `fn` ends. */
   withConnection<T>(fn: (conn: Client) => Promise<T> | T): Promise<T>;
-  /** Close the pool and every idle connection. */
+  withConnection<T>(options: AcquireOptions, fn: (conn: Client) => Promise<T> | T): Promise<T>;
+  /** Every member as the pool sees it, in endpoint order. */
+  members(): PoolMember[];
+  /** Close the pool and every idle connection, and stop its probe/discovery timer. */
   end(): Promise<void>;
+
+  on(event: "eject", listener: (e: EjectEvent) => void): this;
+  on(event: "readmit", listener: (e: ReadmitEvent) => void): this;
+  on(event: string | symbol, listener: (...args: any[]) => void): this;
+  once(event: "eject", listener: (e: EjectEvent) => void): this;
+  once(event: "readmit", listener: (e: ReadmitEvent) => void): this;
+  once(event: string | symbol, listener: (...args: any[]) => void): this;
 }
 
 /** Every error the driver raises: statement errors, protocol errors, connection errors. */

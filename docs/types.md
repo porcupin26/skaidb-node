@@ -43,7 +43,8 @@ any Node project already has.
 ```ts
 import { Client, Pool, SkaidbError, CONSISTENCY,
          ClientOptions, PoolOptions, QueryResult, QueryConfig,
-         StreamOptions, StreamEvent, SubscribeOptions, Value, Consistency } from '@skaidb/client';
+         StreamOptions, StreamEvent, SubscribeOptions, Value, Consistency,
+         LoadBalancing, IdleOrder, AcquireOptions, PoolMember, MemberState } from '@skaidb/client';
 ```
 
 ### Typed rows
@@ -69,7 +70,10 @@ for `rowMode: 'array'` and for `Document`-shaped columns.
 
 ### Options and results
 
-`ClientOptions`/`PoolOptions` describe the constructors; `QueryConfig` the
+`ClientOptions`/`PoolOptions` describe the constructors (`LoadBalancing`
+and `IdleOrder` the pool's policy strings); `AcquireOptions` the checkout
+argument, `PoolMember` (with `MemberState`) an entry of `pool.members()`,
+and `EjectEvent`/`ReadmitEvent` the pool's events; `QueryConfig` the
 object form of `query()`; `QueryResult<Row>` every result (with optional
 `columns` and `resultSets`); `StreamOptions`, `SubscribeOptions` and
 `StreamEvent` the streaming APIs. `Consistency` is

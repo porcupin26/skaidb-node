@@ -4,6 +4,39 @@ All notable changes to the skaidb Node.js driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-10-25
+
+### Added
+- **Pool load balancing across members** (the rules every skaidb driver
+  shares, PROTOCOL.md §6.1): `loadBalancing: 'round_robin'` /
+  `'least_latency'` (power of two choices on the round-trip average ×
+  checked-out connections, re-measuring a member not used for 2 s;
+  `'random'` stays the default), `idleOrder: 'fifo'`, health ejection
+  (consecutive transport failures, or a latency average far above the other
+  members') with a background probe that re-admits the member,
+  `discover: true` (members from `SHOW ENDPOINTS`, server ≥ 0.327: joiners
+  added, leavers dropped, resyncing/unreachable members skipped and
+  re-checked every 5 s), and `readYourWrites: <ms>` with
+  `acquire({ affinity })` / `withConnection({ affinity }, fn)` — reads
+  follow the member that took the key's last write. `pool.members()`
+  reports each member's state, latency and connections, and the pool emits
+  `'eject'` and `'readmit'`. The probe/discovery timer is `unref()`'d and
+  stops with `pool.end()`.
+
+### Changed
+- A pooled connection that re-dials does so in the pool's order (usable
+  members first, the one it lost last) instead of walking the shuffled
+  seeds.
+- `Pool` is an `EventEmitter`, and `release()` closes a connection whose
+  member is ejected, not `ready` or unknown to the pool (such as a client
+  the pool did not create) instead of keeping it idle.
+
+### Fixed
+- A seed that accepted the TCP connection and then closed it during the
+  handshake made every later seed in the same walk fail with
+  `connection lost`, so `connect()` (and a reconnect) gave up while a
+  healthy seed was still untried. Each attempt now starts clean.
+
 ## [1.1.0] - 2026-09-26
 
 ### Added

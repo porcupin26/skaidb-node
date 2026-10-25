@@ -6,7 +6,8 @@
 import {
   Client, Pool, SkaidbError, CONSISTENCY,
   ClientOptions, PoolOptions, QueryResult, QueryConfig, StreamEvent, Value, Consistency,
-  AuthMechanism, BatchOptions,
+  AuthMechanism, BatchOptions, LoadBalancing, IdleOrder, MemberState, PoolMember, AcquireOptions,
+  EjectEvent, ReadmitEvent,
 } from '@skaidb/client';
 
 interface User { id: number; name: string; tags: string[] }
@@ -124,6 +125,35 @@ async function main(): Promise<void> {
   const closed: boolean = pool.closed;
   const max: number = pool.maxsize;
   await pool.end();
+
+  // Load balancing across members: every option, affinity on checkout,
+  // introspection and the eject/readmit events.
+  const policy: LoadBalancing = 'least_latency';
+  const order: IdleOrder = 'fifo';
+  const balanced = new Pool({
+    ...opts, loadBalancing: policy, idleOrder: order, discover: true, refreshInterval: 30000,
+    readYourWrites: 2000, ejectErrors: 3, ejectLatencyFactor: 3, ejectLatencyFloor: 50,
+    ejectBackoff: 5000, ejectBackoffMax: 60000,
+  });
+  const affinity: AcquireOptions = { affinity: 'user-42' };
+  const mine: Client = await balanced.acquire(affinity);
+  await balanced.release(mine);
+  const sameMember: number = await balanced.withConnection({ affinity: 42 }, async (c) => {
+    await c.query('INSERT INTO notes (id) VALUES ($1)', [1]);
+    return 1;
+  });
+  const rows: PoolMember[] = balanced.members();
+  const memberState: MemberState = rows[0].state;
+  const latency: number | null = rows[0].latencyMs;
+  const canonical: string | null = rows[0].canonical;
+  const counts: number = rows[0].inUse + rows[0].idle;
+  const isSeed: boolean = rows[0].seed;
+  balanced.on('eject', (e: EjectEvent) => { const why: string = e.reason; void [e.endpoint, why]; });
+  balanced.once('readmit', (e: ReadmitEvent) => { void e.endpoint; });
+  await balanced.end();
+  void [sameMember, memberState, latency, canonical, counts, isSeed];
+  // @ts-expect-error not a policy
+  void new Pool({ loadBalancing: 'nearest' });
 
   // Errors are SkaidbError instances (and Errors).
   try {

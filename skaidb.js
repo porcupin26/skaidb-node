@@ -14,6 +14,7 @@ const net = require('net');
 const tls = require('tls');
 const fs = require('fs');
 const crypto = require('crypto');
+const { EventEmitter } = require('events');
 
 const CONSISTENCY = { ONE: 0, QUORUM: 1, ALL: 2 };
 
@@ -24,6 +25,16 @@ const CONSISTENCY = { ONE: 0, QUORUM: 1, ALL: 2 };
 const DRAIN_BUDGET_BYTES = 8 * 1024 * 1024;
 
 class SkaidbError extends Error {}
+
+// Errors the server answered with (an Error frame): the statement failed and
+// the member that sent it is fine. A pool tells them apart from transport
+// failures, which count against a member's health.
+const statementErrors = new WeakSet();
+function statementError(msg) {
+  const e = new SkaidbError(msg);
+  statementErrors.add(e);
+  return e;
+}
 
 // ---- Value codec (§4 of PROTOCOL.md) --------------------------------------
 
@@ -271,12 +282,7 @@ class Client {
     // primary to discover. Shuffled per connect so many clients spread
     // across the cluster instead of stampeding the first entry.
     this.seeds = (opts.seeds && opts.seeds.length ? opts.seeds : [`${this.host}:${this.port}`])
-      .map((s) => {
-        const i = String(s).lastIndexOf(':');
-        return i > 0
-          ? { host: String(s).slice(0, i), port: Number(String(s).slice(i + 1)) }
-          : { host: String(s), port: this.port };
-      });
+      .map((s) => parseEndpoint(s, this.port));
     // Certificate login (wire mechanism EXTERNAL): the TLS client
     // certificate IS the credential and its Common Name the username, so
     // no password is sent. `user`, when given, only asserts the identity
@@ -325,6 +331,15 @@ class Client {
     this._broken = false;      // transport died: recoverable on next statement
     this._reconnecting = false;
     this._prepared = new Map();
+    this._connected = null;    // 'host:port' reached by the last successful dial
+    // The pool that owns this client (see Pool): told each round trip's
+    // latency, each transport failure and each write, and asked for the dial
+    // order when the client re-dials. null outside a pool; the other _pool*
+    // slots are the pool's bookkeeping.
+    this._pool = null;
+    this._poolEp = null;
+    this._poolOut = false;
+    this._poolAffinity = null;
   }
 
   /**
@@ -332,19 +347,31 @@ class Client {
    * that accepts TCP while unhealthy must not swallow the attempt.
    */
   async connect() {
-    const order = this.seeds.slice();
-    for (let i = order.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [order[i], order[j]] = [order[j], order[i]];
-    }
+    return this._connectVia(shuffle(this.seeds.slice()));
+  }
+
+  /**
+   * Dial the endpoints of `order` ({host, port}) in turn until one connects
+   * and authenticates. A pooled client reports each failed endpoint whose
+   * failure says something about the member's health.
+   */
+  async _connectVia(order) {
+    this._connected = null;
     let last;
     for (const seed of order) {
       this.host = seed.host;
       this.port = seed.port;
+      // An attempt that died mid-handshake leaves the client marked broken,
+      // and a broken client refuses to read a frame: without the reset every
+      // later endpoint failed with "connection lost".
+      this._broken = false;
       try {
-        return await this._connectOne();
+        await this._connectOne();
+        this._connected = `${seed.host}:${seed.port}`;
+        return;
       } catch (e) {
         last = e;
+        if (this._pool !== null && memberFault(e)) this._pool._failed(`${seed.host}:${seed.port}`);
       }
     }
     throw new SkaidbError(
@@ -512,6 +539,9 @@ class Client {
     if (!this._broken || this._reconnecting) return;
     this._reconnecting = true;
     try {
+      // Pooled: the pool's current order (usable members first, the one
+      // just lost last) instead of the seeds.
+      const order = this._pool !== null ? this._pool._dialOrder(this._connected) : null;
       this._prepared.clear();
       this._waiters = [];
       this._frames = [];
@@ -519,7 +549,8 @@ class Client {
       try { if (this._sock) this._sock.destroy(); } catch (_) { /* already gone */ }
       this._sock = null;
       this._broken = false;
-      await this.connect();          // re-runs seed failover + handshake + USE
+      if (order !== null) await this._connectVia(order);
+      else await this.connect();     // re-runs seed failover + handshake + USE
     } catch (e) {
       this._broken = true;           // still down; the next call tries again
       throw e;
@@ -562,6 +593,34 @@ class Client {
     if (this._broken) return Promise.reject(new SkaidbError('connection lost'));
     if (this._closed) return Promise.reject(new SkaidbError('connection is closed'));
     return new Promise((resolve, reject) => this._waiters.push({ resolve, reject }));
+  }
+
+  /**
+   * Send one request and wait for the first frame of its answer. A pooled
+   * client reports the round trip's latency to its pool, or the transport
+   * failure that cut it short (a connection end()ed meanwhile is neither).
+   */
+  async _request(payload) {
+    const started = performance.now();
+    let frame;
+    try {
+      this._writeFrame(payload);
+      frame = await this._readFrame();
+    } catch (e) {
+      if (this._pool !== null && this._connected !== null && this._broken && !this._closed) {
+        this._pool._failed(this._connected);
+      }
+      throw e;
+    }
+    if (this._pool !== null && this._connected !== null) {
+      this._pool._roundTrip(this, performance.now() - started);
+    }
+    return frame;
+  }
+
+  /** A statement succeeded: a pool with read-your-writes remembers which member took a write. */
+  _noteStatement(sql) {
+    if (this._pool !== null && isWrite(sql)) this._pool._wrote(this);
   }
 
   async _handshake() {
@@ -631,6 +690,9 @@ class Client {
         }
       }
       return this._doQuery(bindParams(text, params), consistency, rowMode);
+    }).then((res) => {
+      this._noteStatement(text);
+      return res;
     });
     this._queryChain = run.catch(() => {}); // keep the chain alive after errors
     return run;
@@ -698,15 +760,14 @@ class Client {
       const body = Buffer.from(sql, 'utf8');
       const head = Buffer.allocUnsafe(6);
       head[0] = 5; head[1] = consistency; head.writeUInt32LE(body.length, 2);
-      this._writeFrame(Buffer.concat([head, body]));
-
-      const first = new Reader(await this._readFrame());
+      const first = new Reader(await this._request(Buffer.concat([head, body])));
       const tag = first.u8();
       if (tag === 3) {
         const msg = first.text();
-        throw new SkaidbError(msg.includes('unknown opcode')
+        throw statementError(msg.includes('unknown opcode')
           ? `server does not support streaming: ${msg}` : msg);
       }
+      this._noteStatement(sql);
       if (tag === 1) {                         // mutation: no rows, a count
         this.stream.command = 'MUTATION';
         this.stream.affected = safeInt(first.u64());
@@ -742,7 +803,7 @@ class Client {
         } else if (t === 3) {
           streaming = false;
           // Rows already yielded are valid; the statement failed partway.
-          throw new SkaidbError(r.text());
+          throw statementError(r.text());
         } else {
           throw this._desync(`unexpected frame tag ${t} in stream`);
         }
@@ -812,6 +873,7 @@ class Client {
         for (const v of r) { const b = encodeValue(v); parts.push(u32le(b.length), b); }
       }
       const res = await this._roundtrip(Buffer.concat(parts), 'object');
+      this._noteStatement(sql);
       return res.rowCount || 0;
     });
     this._queryChain = run.catch(() => {});
@@ -830,8 +892,7 @@ class Client {
     const body = Buffer.from(sql, 'utf8');
     const head = Buffer.allocUnsafe(5);
     head[0] = 2; head.writeUInt32LE(body.length, 1);
-    this._writeFrame(Buffer.concat([head, body]));
-    const r = new Reader(await this._readFrame());
+    const r = new Reader(await this._request(Buffer.concat([head, body])));
     const tag = r.u8();
     if (tag === 4) {
       const id = r.u32();
@@ -860,9 +921,7 @@ class Client {
   async _roundtrip(request, rowMode) {
     if (this._closed) throw new SkaidbError('connection is closed');
     if (this._broken) throw new SkaidbError('connection lost');
-    this._writeFrame(request);
-
-    const r = new Reader(await this._readFrame());
+    const r = new Reader(await this._request(request));
     const tag = r.u8();
     if (tag === 0) {                            // Rows
       const ncols = r.u32();
@@ -918,7 +977,7 @@ class Client {
       return { command: 'MUTATION', rowCount: safeInt(affected), rows: [], fields: [] };
     }
     if (tag === 2) return { command: 'DDL', rowCount: null, rows: [], fields: [] };
-    if (tag === 3) throw new SkaidbError(r.text());
+    if (tag === 3) throw statementError(r.text());
     throw new SkaidbError(`unknown response tag ${tag}`);
   }
 
@@ -1001,6 +1060,9 @@ class Client {
 
   end() {
     this._closed = true;
+    // Closed while checked out instead of released: the pool stops counting
+    // it against its member.
+    if (this._pool !== null && this._poolOut) this._pool._closedOut(this);
     return new Promise((resolve) => {
       if (!this._sock) return resolve();
       this._sock.end(resolve);
@@ -1009,6 +1071,22 @@ class Client {
 }
 
 // ---- helpers --------------------------------------------------------------
+
+/** `'host:port'`, or a bare host that takes `defaultPort`, as {host, port}. */
+function parseEndpoint(s, defaultPort) {
+  const t = String(s);
+  const i = t.lastIndexOf(':');
+  return i > 0 ? { host: t.slice(0, i), port: Number(t.slice(i + 1)) } : { host: t, port: defaultPort };
+}
+
+/** Fisher-Yates, in place; returns `arr`. */
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
 
 function resolveConsistency(c) {
   if (c === undefined) return CONSISTENCY.QUORUM;
@@ -1061,57 +1139,263 @@ function scramProof(password, salt, iterations, authMessage) {
 function sha256(b) { return crypto.createHash('sha256').update(b).digest(); }
 function xor(a, b) { const o = Buffer.allocUnsafe(a.length); for (let i = 0; i < a.length; i++) o[i] = a[i] ^ b[i]; return o; }
 
+// ---- connection pool ------------------------------------------------------
+//
+// The balancing rules are shared by every skaidb driver (PROTOCOL.md §6.1):
+// policies, idle order, latency averages, health ejection with re-probe,
+// discovery from SHOW ENDPOINTS and read-your-writes affinity.
+
+// Leading keywords of statements that never write: everything else counts as
+// a write for read-your-writes affinity (a read taken for a write only keeps
+// the caller on its member a little longer).
+const READ_KEYWORDS = new Set(['select', 'show', 'explain', 'describe', 'desc', 'values', 'with', 'use']);
+
+/** Whether `sql` counts as a write: its first keyword, past whitespace, comments and `(`, is not a read. */
+function isWrite(sql) {
+  const s = String(sql);
+  const n = s.length;
+  let i = 0;
+  while (i < n) {
+    if (/\s/.test(s[i]) || s[i] === '(') i++;
+    else if (s.startsWith('--', i)) { const j = s.indexOf('\n', i); i = j < 0 ? n : j + 1; }
+    else if (s.startsWith('/*', i)) { const j = s.indexOf('*/', i + 2); i = j < 0 ? n : j + 2; }
+    else break;
+  }
+  let j = i;
+  while (j < n && (/\p{L}/u.test(s[j]) || s[j] === '_')) j++;
+  return !READ_KEYWORDS.has(s.slice(i, j).toLowerCase());
+}
+
 /**
- * A pool of skaidb connections.
+ * Whether a failed dial says something about the member's health. A refused
+ * login is the caller's problem, not the member's — except a capacity
+ * refusal, which is the member being full. Neither is a statement error (a
+ * USE of a missing database) or a local certificate file that cannot be read.
+ */
+function memberFault(e) {
+  if (statementErrors.has(e)) return false;
+  const msg = String(e && e.message !== undefined ? e.message : e);
+  if (msg.startsWith('authentication denied')) return msg.includes('too many connections:');
+  if (msg.startsWith('cannot read ')) return false;
+  return !msg.startsWith('server signature mismatch');
+}
+
+// Latency EWMA: each round trip moves a member's average 5% toward it, and no
+// sample counts for more than 10x the larger of the current average and the
+// ejection floor — one slow query does not eject a healthy member, a member
+// that stays slow is ejected within a few dozen statements.
+const EWMA_WEIGHT = 0.05;
+const EWMA_CLAMP = 10;
+// Round trips a member (and at least one other) needs before its average
+// can eject it.
+const EWMA_MIN_SAMPLES = 10;
+// least_latency: a member whose last round trip is older than this scores 0,
+// so a lightly loaded pool keeps re-measuring every member instead of
+// settling forever on whichever answered fastest once.
+const STALE_SAMPLE_MS = 2000;
+// How often the background timer checks for members due a re-probe.
+const MAINTAIN_TICK_MS = 250;
+// Discovery refresh while a listed member is not ready: a member is often
+// `unreachable` or `resyncing` only for seconds (a peer's circuit breaker
+// right after it restarts), and waiting a whole refresh interval to let it
+// back in leaves the load on the others.
+const REFRESH_NOT_READY_MS = 5000;
+// Affinity keys kept before expired ones are swept out.
+const AFFINITY_SWEEP_AT = 4096;
+
+const POLICIES = ['random', 'round_robin', 'least_latency'];
+const LISTED_STATES = ['ready', 'resyncing', 'unreachable'];
+
+/** One member as the pool sees it. */
+class Member {
+  constructor(ep, seed) {
+    this.host = ep.host;              // what the pool dials
+    this.port = ep.port;
+    this.key = `${ep.host}:${ep.port}`;
+    this.seed = seed;                 // configured: discovery never drops it
+    this.canonical = null;            // its own SHOW ENDPOINTS name
+    this.listed = 'ready';            // ready | resyncing | unreachable | unlisted
+    this.ewma = null;                 // round-trip average, milliseconds
+    this.samples = 0;
+    this.lastSample = -Infinity;
+    this.errors = 0;                  // consecutive transport failures
+    this.ejectedUntil = null;         // null = admitted
+    this.ejections = 0;
+    this.readmittedAt = -Infinity;
+    this.inUse = 0;
+    this.probing = false;
+  }
+}
+
+/** Endpoint order: host, then port numerically. */
+function byEndpoint(a, b) {
+  if (a.host !== b.host) return a.host < b.host ? -1 : 1;
+  return a.port - b.port;
+}
+
+/**
+ * A pool of skaidb connections, balanced across the cluster's members.
  *
  * `maxsize` bounds the connections kept IDLE, not the number checked out:
  * a burst creates extras and the surplus is closed on return. Every Client
- * option passes through, so pooled connections inherit seed failover, TLS
- * and the session database.
+ * option passes through, so pooled connections inherit TLS, the session
+ * database and the default consistency; `seeds` (or `host`/`port`) name the
+ * starting members.
  *
- *     const pool = new Pool({ seeds: ['h1:7000', 'h2:7000'], database: 'app', maxsize: 8 });
+ * Load balancing (milliseconds for every duration):
+ *
+ * - `loadBalancing` — `'random'` (default: each new connection dials the
+ *   members in random order), `'round_robin'` (checkouts rotate over the
+ *   members) or `'least_latency'` (of two members picked at random, the one
+ *   with the lower latency average × checked-out connections).
+ * - `idleOrder` — `'lifo'` (default: the most recently returned idle
+ *   connection first) or `'fifo'` (the longest idle first, so every idle
+ *   connection keeps getting used).
+ * - `discover` — read the members from `SHOW ENDPOINTS` (server >= 0.327)
+ *   when connections are first made to them and every `refreshInterval`
+ *   after: members joining the cluster are added, members the server
+ *   reports `resyncing` or `unreachable` get no new connections until they
+ *   are `ready` again.
+ * - Health ejection: a member with `ejectErrors` consecutive transport
+ *   failures, or whose latency average is above `ejectLatencyFactor` times
+ *   the other members' median and at least `ejectLatencyFloor` slower, gets
+ *   no connections for `ejectBackoff` (doubling per repeat, up to
+ *   `ejectBackoffMax`), then a background probe re-admits it. The last
+ *   usable member is never ejected. The pool emits `'eject'`
+ *   ({endpoint, reason}) and `'readmit'` ({endpoint}).
+ * - `readYourWrites` — how long after a write checkouts with the same
+ *   `affinity` go to the member that took it (the coordinator that
+ *   acknowledged a write reads it back even at ONE). 0 (default) is off.
+ *
+ *     const pool = new Pool({ seeds: ['h1:7000', 'h2:7000'], database: 'app', maxsize: 8,
+ *                             loadBalancing: 'least_latency', discover: true });
  *     const res = await pool.withConnection((c) => c.query('SELECT 1'));
  *     await pool.end();
+ *
+ * The probe/discovery timer is unref()'d, so it never keeps the process
+ * alive, and stops when the pool ends.
  */
-class Pool {
+class Pool extends EventEmitter {
   constructor(opts = {}) {
-    const { maxsize = 10, ...clientOpts } = opts;
+    super();
+    const {
+      maxsize = 10,
+      loadBalancing = 'random',
+      idleOrder = 'lifo',
+      discover = false,
+      refreshInterval = 60000,
+      readYourWrites = 0,
+      ejectErrors = 3,
+      ejectLatencyFactor = 3,
+      ejectLatencyFloor = 50,
+      ejectBackoff = 5000,
+      ejectBackoffMax = 60000,
+      ...clientOpts
+    } = opts;
     if (maxsize < 1) throw new SkaidbError('maxsize must be >= 1');
+    if (!POLICIES.includes(loadBalancing)) {
+      throw new SkaidbError(
+        `unknown loadBalancing ${loadBalancing} (use 'random', 'round_robin' or 'least_latency')`);
+    }
+    if (idleOrder !== 'lifo' && idleOrder !== 'fifo') {
+      throw new SkaidbError(`unknown idleOrder ${idleOrder} (use 'lifo' or 'fifo')`);
+    }
+    if (!(ejectErrors >= 1)) throw new SkaidbError('ejectErrors must be >= 1');
     this.maxsize = maxsize;
     this._opts = clientOpts;
+    this._policy = loadBalancing;
+    this._fifo = idleOrder === 'fifo';
+    this._discover = discover === true;
+    this._refreshInterval = refreshInterval;
+    this._ryw = readYourWrites;
+    this._ejectErrors = ejectErrors;
+    this._ejectFactor = ejectLatencyFactor;
+    this._ejectFloor = ejectLatencyFloor;
+    this._backoff = ejectBackoff;
+    this._backoffMax = ejectBackoffMax;
+    // The pool's own statements (probe, SHOW ENDPOINTS) give up after this
+    // long: the driver has no read timeout, and a member that never answers
+    // must not wedge a probe or a refresh for good.
+    this._answerTimeout = clientOpts.connectTimeout || 10000;
+    this._port = clientOpts.port || 7000;
+    this._members = new Map();         // 'host:port' -> Member
+    const seeds = clientOpts.seeds && clientOpts.seeds.length
+      ? clientOpts.seeds : [`${clientOpts.host || 'localhost'}:${this._port}`];
+    for (const s of seeds) {
+      const m = new Member(parseEndpoint(s, this._port), true);
+      if (!this._members.has(m.key)) this._members.set(m.key, m);
+    }
     this._idle = [];
+    this._rr = -1;
+    this._affinity = new Map();        // affinity key -> {key, until}
+    this._discoveryOff = false;
+    this._nextRefresh = 0;
+    this._refreshing = false;
+    this._timer = null;
     this.closed = false;
   }
 
-  /** Check out a usable connection, reusing an idle one when possible. */
-  async acquire() {
+  // -- checkout / checkin --
+
+  /**
+   * Check out a usable connection: an idle one to the member the policy
+   * picks, or a new one dialed to it (falling back to the other members).
+   * `options.affinity` scopes read-your-writes — a user or session id; left
+   * out, checkouts share one pool-wide key.
+   */
+  async acquire(options = {}) {
+    const affinity = options && options.affinity !== undefined ? options.affinity : null;
     for (;;) {
       if (this.closed) throw new SkaidbError('pool is closed');
-      const conn = this._idle.pop();
-      if (!conn) {
-        const fresh = new Client(this._opts);
-        await fresh.connect();
-        return fresh;
+      const target = this._pick(affinity);
+      const { conn: idle, stale } = this._takeIdle(target);
+      for (const c of stale) c.end().catch(() => {});
+      let conn = idle;
+      if (conn === null) {
+        conn = new Client(this._opts);
+        conn._pool = this;
+        await conn._connectVia(this._order(target));
+        conn._poolEp = conn._connected;
+        await this._discoverThrough(conn);
       }
       // A connection the server closed while it sat idle still looks fine
       // locally, so validate before handing it out; discard and try again.
-      if (conn.isUsable()) return conn;
-      await conn.end().catch(() => {});
+      if (!conn.isUsable()) {
+        await conn.end().catch(() => {});
+        continue;
+      }
+      const m = this._members.get(conn._poolEp);
+      if (m) m.inUse++;
+      conn._poolAffinity = affinity;
+      conn._poolOut = true;
+      return conn;
     }
   }
 
-  /** Return a connection, closing it if it is broken or the pool is full. */
+  /**
+   * Return a connection, closing it if it is broken, its member is ejected,
+   * not ready or gone, or the pool is full.
+   */
   async release(conn) {
-    if (!this.closed && conn.isUsable() && this._idle.length < this.maxsize) {
+    const m = this._members.get(conn._poolEp);
+    if (conn._poolOut) {
+      conn._poolOut = false;
+      if (m && m.inUse > 0) m.inUse--;
+    }
+    if (!this.closed && conn.isUsable() && m && this._usable(m) && this._idle.length < this.maxsize) {
       this._idle.push(conn);
       return;
     }
     await conn.end().catch(() => {});
   }
 
-  /** Run `fn` with a checked-out connection, returning it however fn ends. */
-  async withConnection(fn) {
-    const conn = await this.acquire();
+  /**
+   * Run `fn` with a checked-out connection, returning it however fn ends:
+   * `withConnection(fn)` or `withConnection({ affinity }, fn)`.
+   */
+  async withConnection(a, b) {
+    const [options, fn] = typeof a === 'function' ? [b, a] : [a, b];
+    const conn = await this.acquire(options);
     try {
       return await fn(conn);
     } finally {
@@ -1119,12 +1403,403 @@ class Pool {
     }
   }
 
+  /**
+   * The members as the pool sees them, for monitoring: `endpoint` (what the
+   * pool dials), `canonical` (the member's own name, once discovered),
+   * `state` (`ready`, `ejected`, `resyncing`, `unreachable`, `unlisted`),
+   * `latencyMs` (the round-trip average, null until measured), `inUse`,
+   * `idle` and `seed`.
+   */
+  members() {
+    const idle = new Map();
+    for (const c of this._idle) idle.set(c._poolEp, (idle.get(c._poolEp) || 0) + 1);
+    return [...this._members.values()].sort(byEndpoint).map((m) => ({
+      endpoint: m.key,
+      canonical: m.canonical,
+      state: m.ejectedUntil !== null ? 'ejected' : m.listed,
+      latencyMs: m.ewma,
+      inUse: m.inUse,
+      idle: idle.get(m.key) || 0,
+      seed: m.seed,
+    }));
+  }
+
   /** Close the pool and every idle connection. Checked-out ones close on release. */
   async end() {
     this.closed = true;
+    if (this._timer !== null) {
+      clearInterval(this._timer);
+      this._timer = null;
+    }
     const idle = this._idle;
     this._idle = [];
     await Promise.all(idle.map((c) => c.end().catch(() => {})));
+  }
+
+  // -- choosing a member --
+
+  _usable(m) {
+    return m.ejectedUntil === null && m.listed === 'ready';
+  }
+
+  /**
+   * The member this checkout should go to, or null for "any" (the random
+   * policy, or no usable member at all).
+   */
+  _pick(affinity) {
+    if (this._ryw > 0) {
+      const hit = this._affinity.get(affinity);
+      if (hit !== undefined) {
+        const m = this._members.get(hit.key);
+        if (performance.now() >= hit.until || !m) this._affinity.delete(affinity);
+        else if (this._usable(m)) return m;
+      }
+    }
+    const usable = [...this._members.values()].filter((m) => this._usable(m));
+    if (usable.length === 0 || this._policy === 'random') return null;
+    if (this._policy === 'round_robin') {
+      usable.sort(byEndpoint);
+      this._rr = (this._rr + 1) % usable.length;
+      return usable[this._rr];
+    }
+    if (usable.length === 1) return usable[0];
+    const i = Math.floor(Math.random() * usable.length);
+    let j = Math.floor(Math.random() * (usable.length - 1));
+    if (j >= i) j++;
+    return this._score(usable[i]) <= this._score(usable[j]) ? usable[i] : usable[j];
+  }
+
+  _score(m) {
+    // A member never measured, or not lately, scores 0: it is tried and
+    // measured.
+    if (m.ewma === null || performance.now() - m.lastSample > STALE_SAMPLE_MS) return 0;
+    return m.ewma * (m.inUse + 1);
+  }
+
+  /**
+   * Remove and return an idle connection (to `target`, or to any usable
+   * member), plus the idle connections found to belong to members that are
+   * no longer usable, for the caller to close.
+   */
+  _takeIdle(target) {
+    const n = this._idle.length;
+    const stale = [];
+    let found = -1;
+    for (let k = 0; k < n; k++) {
+      const i = this._fifo ? k : n - 1 - k;
+      const m = this._members.get(this._idle[i]._poolEp);
+      if (!m || !this._usable(m)) { stale.push(i); continue; }
+      if (target === null || m === target) { found = i; break; }
+    }
+    const conn = found >= 0 ? this._idle[found] : null;
+    const drop = new Set(stale);
+    if (found >= 0) drop.add(found);
+    const staleConns = stale.map((i) => this._idle[i]);
+    if (drop.size) this._idle = this._idle.filter((_, i) => !drop.has(i));
+    return { conn, stale: staleConns };
+  }
+
+  /**
+   * Endpoints to dial, best first: `first`, the other usable members in
+   * random order, then the rest (resyncing/unreachable before ejected,
+   * soonest re-admission first), with `exclude` (a key) moved last — a dial
+   * never has nowhere to go while any member is configured.
+   */
+  _order(first = null, exclude = null) {
+    const all = [...this._members.values()];
+    const usable = shuffle(all.filter((m) => m !== first && this._usable(m)));
+    const rest = all.filter((m) => m !== first && !this._usable(m)).sort((a, b) =>
+      (a.ejectedUntil !== null) - (b.ejectedUntil !== null)
+      || (a.ejectedUntil || 0) - (b.ejectedUntil || 0));
+    const order = (first !== null ? [first] : []).concat(usable, rest);
+    const i = exclude === null ? -1 : order.findIndex((m) => m.key === exclude);
+    if (i >= 0 && order.length > 1) order.push(order.splice(i, 1)[0]);
+    return order.map((m) => ({ host: m.host, port: m.port }));
+  }
+
+  // -- what connections report --
+
+  /** A pooled connection re-dialing: the pool's order, the member it lost last. */
+  _dialOrder(exclude) {
+    return this._order(null, exclude);
+  }
+
+  _roundTrip(conn, ms) {
+    const key = conn._connected;
+    if (key !== conn._poolEp) {
+      // The connection re-dialed to another member mid-checkout.
+      if (conn._poolOut) {
+        const old = this._members.get(conn._poolEp);
+        if (old && old.inUse > 0) old.inUse--;
+        const now = this._members.get(key);
+        if (now) now.inUse++;
+      }
+      conn._poolEp = key;
+    }
+    const m = this._members.get(key);
+    if (!m) return;
+    m.errors = 0;
+    if (m.ewma === null) {
+      m.ewma = ms;
+    } else {
+      const cap = EWMA_CLAMP * Math.max(m.ewma, this._ejectFloor);
+      m.ewma += EWMA_WEIGHT * (Math.min(ms, cap) - m.ewma);
+    }
+    m.samples++;
+    m.lastSample = performance.now();
+    // Only a member still in rotation can be ejected for latency: round trips
+    // finishing on connections checked out before an ejection must not eject
+    // it again (and double its backoff).
+    if (this._usable(m) && m.samples >= EWMA_MIN_SAMPLES && this._ejectFactor > 0) {
+      const others = [];
+      for (const o of this._members.values()) {
+        if (o !== m && this._usable(o) && o.ewma !== null && o.samples >= EWMA_MIN_SAMPLES) {
+          others.push(o.ewma);
+        }
+      }
+      if (others.length) {
+        others.sort((x, y) => x - y);
+        const median = others[(others.length - 1) >> 1];   // the lower middle when even
+        if (m.ewma > this._ejectFactor * median && m.ewma - median > this._ejectFloor) {
+          this._eject(m, `latency ${m.ewma.toFixed(1)} ms vs median ${median.toFixed(1)} ms`);
+        }
+      }
+    }
+  }
+
+  _failed(key) {
+    const m = this._members.get(key);
+    if (!m) return;
+    m.errors++;
+    if (m.errors >= this._ejectErrors && m.ejectedUntil === null) {
+      this._eject(m, `${m.errors} consecutive connection failures`);
+    }
+  }
+
+  _closedOut(conn) {
+    if (!conn._poolOut) return;
+    conn._poolOut = false;
+    const m = this._members.get(conn._poolEp);
+    if (m && m.inUse > 0) m.inUse--;
+  }
+
+  _wrote(conn) {
+    if (!(this._ryw > 0) || !conn._poolOut) return;
+    const now = performance.now();
+    if (this._affinity.size >= AFFINITY_SWEEP_AT) {
+      for (const [k, v] of this._affinity) if (v.until <= now) this._affinity.delete(k);
+    }
+    this._affinity.set(conn._poolAffinity, { key: conn._connected, until: now + this._ryw });
+  }
+
+  // -- ejection and re-admission --
+
+  /**
+   * Take `m` out of rotation and close its idle connections — unless it is
+   * the last usable member: a slow or flaky member beats none.
+   */
+  _eject(m, reason) {
+    let other = false;
+    for (const o of this._members.values()) if (o !== m && this._usable(o)) { other = true; break; }
+    if (!other) return;
+    const now = performance.now();
+    if (now - m.readmittedAt > this._backoffMax) m.ejections = 0;   // healthy for a while: start over
+    m.ejections++;
+    m.ejectedUntil = now + this._backoffFor(m);
+    const idle = this._idle.filter((c) => c._poolEp === m.key);
+    if (idle.length) {
+      this._idle = this._idle.filter((c) => c._poolEp !== m.key);
+      for (const c of idle) c.end().catch(() => {});
+    }
+    // Listeners run on the next tick: one that throws must not fail the
+    // statement that happened to report the ejection.
+    process.nextTick(() => this.emit('eject', { endpoint: m.key, reason }));
+    this._ensureMaintainer();
+  }
+
+  _backoffFor(m) {
+    return Math.min(this._backoff * 2 ** Math.max(m.ejections - 1, 0), this._backoffMax);
+  }
+
+  /**
+   * Start the background timer: it re-probes ejected members and refreshes
+   * discovery. unref()'d, so it never holds the process open; end() stops it.
+   */
+  _ensureMaintainer() {
+    if (this._timer === null && !this.closed) {
+      this._timer = setInterval(() => this._maintain(), MAINTAIN_TICK_MS);
+      this._timer.unref();
+    }
+  }
+
+  _maintain() {
+    if (this.closed) return;
+    const now = performance.now();
+    for (const m of this._members.values()) {
+      if (m.ejectedUntil !== null && now >= m.ejectedUntil && !m.probing) {
+        m.probing = true;
+        this._probe(m).catch(() => { m.probing = false; });
+      }
+    }
+    if (this._discover && !this._discoveryOff && !this._refreshing && now >= this._nextRefresh) {
+      this._refreshing = true;
+      this._refresh().catch(() => {}).then(() => { this._refreshing = false; });
+    }
+  }
+
+  /**
+   * Dial `m` alone and run one statement: success re-admits it (the probe
+   * connection joins the idle set), failure ejects it again for twice as long.
+   */
+  async _probe(m) {
+    let conn = null;
+    let ok = false;
+    try {
+      conn = new Client(this._opts);
+      await conn._connectVia([{ host: m.host, port: m.port }]);
+      await this._bounded(conn, conn.query('SHOW DATABASES'));
+      ok = conn.isUsable();
+    } catch (_) {
+      ok = false;
+    }
+    m.probing = false;
+    if (this.closed) ok = false;
+    if (ok) {
+      m.ejectedUntil = null;
+      m.errors = 0;
+      m.ewma = null;
+      m.samples = 0;
+      m.readmittedAt = performance.now();
+      process.nextTick(() => this.emit('readmit', { endpoint: m.key }));
+      if (this._members.get(m.key) === m && this._idle.length < this.maxsize) {
+        conn._pool = this;
+        conn._poolEp = m.key;
+        this._idle.push(conn);
+        conn = null;
+      }
+    } else {
+      m.ejections++;
+      m.ejectedUntil = performance.now() + this._backoffFor(m);
+    }
+    if (conn !== null) await conn.end().catch(() => {});
+  }
+
+  /**
+   * `promise`, a statement the pool itself runs on `conn`, failing `conn`
+   * (as a transport timeout) if no answer comes within the connect timeout.
+   */
+  async _bounded(conn, promise) {
+    const timer = setTimeout(
+      () => conn._fail(new SkaidbError('no answer within the connect timeout')), this._answerTimeout);
+    timer.unref();
+    try {
+      return await promise;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // -- discovery --
+
+  /**
+   * Run discovery on a freshly dialed connection when the member it reached
+   * has not named itself yet (once per member, so seeds given as host names
+   * are matched to the endpoints the server reports).
+   */
+  async _discoverThrough(conn) {
+    if (!this._discover || this._discoveryOff) return;
+    const m = this._members.get(conn._poolEp);
+    if (!m || m.canonical !== null) return;
+    this._ensureMaintainer();
+    await this._listThrough(conn);
+  }
+
+  async _refresh() {
+    let conn;
+    try {
+      conn = await this.acquire();
+    } catch (_) {
+      this._nextRefresh = performance.now() + this._refreshInterval;
+      return;
+    }
+    try {
+      await this._listThrough(conn);
+    } finally {
+      await this.release(conn);
+    }
+  }
+
+  async _listThrough(conn) {
+    let res;
+    try {
+      res = await this._bounded(conn, conn.query({ text: 'SHOW ENDPOINTS', rowMode: 'array' }));
+    } catch (e) {
+      // A server that predates the statement answers an Error: keep the seeds.
+      if (statementErrors.has(e)) this._discoveryOff = true;
+      return;
+    }
+    if (res.rows.length === 0) {
+      // A standalone server: no ring to learn, so keep the seeds and stop asking.
+      this._discoveryOff = true;
+      return;
+    }
+    this._applyListing(conn._poolEp, res.rows);
+    let interval = this._refreshInterval;
+    for (const m of this._members.values()) {
+      if (m.listed === 'resyncing' || m.listed === 'unreachable') {
+        interval = Math.min(interval, REFRESH_NOT_READY_MS);
+        break;
+      }
+    }
+    this._nextRefresh = performance.now() + interval;
+  }
+
+  /** Fold a non-empty `SHOW ENDPOINTS` answer ([endpoint, state, local] rows) in. */
+  _applyListing(dialed, rows) {
+    const listed = new Map();
+    for (const [endpoint, state, local] of rows) {
+      listed.set(endpoint, state);
+      if (local) {
+        const me = this._members.get(dialed);
+        if (me) me.canonical = endpoint;
+      }
+    }
+    // A member reported under the name of one already known (a seed given
+    // as a host name) is that member, not a new one.
+    const byName = new Map();
+    for (const m of this._members.values()) {
+      if (m.canonical !== null && (!byName.has(m.canonical) || m.seed)) byName.set(m.canonical, m);
+    }
+    for (const [key, m] of [...this._members]) {
+      if (m.canonical !== null && byName.get(m.canonical) !== m) this._members.delete(key);  // a seed's duplicate
+    }
+    const seen = new Set();
+    for (const [endpoint, reported] of listed) {
+      let m = byName.get(endpoint);
+      if (!m) {
+        const ep = parseEndpoint(endpoint, this._port);
+        m = this._members.get(`${ep.host}:${ep.port}`);
+        if (!m) {
+          m = new Member(ep, false);
+          this._members.set(m.key, m);
+        }
+        m.canonical = endpoint;
+      }
+      const state = LISTED_STATES.includes(reported) ? reported : 'ready';
+      if (state === 'ready' && m.listed !== 'ready') {
+        // Back in rotation: measured afresh, like a re-admission.
+        m.ewma = null;
+        m.samples = 0;
+        m.errors = 0;
+      }
+      m.listed = state;
+      seen.add(m);
+    }
+    for (const [key, m] of [...this._members]) {
+      if (seen.has(m) || (m.seed && m.canonical === null)) continue;   // listed, or a seed not identified yet
+      if (m.seed) m.listed = 'unlisted';   // configured, but no longer a member
+      else this._members.delete(key);
+    }
   }
 }
 
@@ -1137,4 +1812,5 @@ module.exports._internal = {
   Reader, decodeValue, encodeValue, bindParams, toQmark, quote,
   decimalToString, formatUuid, encStr, u32le, resolveConsistency,
   DRAIN_BUDGET_BYTES, AUTH_MECHANISM, authStartFrame, parseAuthOutcome, scramProof,
+  parseEndpoint, isWrite, memberFault,
 };

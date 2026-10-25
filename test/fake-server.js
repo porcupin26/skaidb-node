@@ -90,14 +90,18 @@ class FakeServer {
    * opts.handle    — (req, conn) => payload | payload[] | undefined
    *                  called for every post-handshake request; Hello is
    *                  answered with Ddl unless the handler returns something.
+   * opts.host      — address to listen on (default '127.0.0.1'); 'localhost'
+   *                  binds whichever family a client's lookup tries first
    */
   constructor(opts = {}) {
     this.password = opts.password === undefined ? 'secret' : opts.password;
+    this.host = opts.host || '127.0.0.1';
     this.handle = opts.handle || (() => F.ddl());
     this.iterations = 1000;
     this.requests = [];        // every parsed post-handshake request, in order
     this.hellos = [];
     this.connections = 0;      // TCP connections accepted so far
+    this.refuse = false;       // true: close each new connection before the handshake
     this.sockets = new Set();
     this.server = null;
     this.port = 0;
@@ -106,7 +110,7 @@ class FakeServer {
   start() {
     return new Promise((resolve) => {
       this.server = net.createServer((sock) => this._onConnection(sock));
-      this.server.listen(0, '127.0.0.1', () => { this.port = this.server.address().port; resolve(this); });
+      this.server.listen(0, this.host, () => { this.port = this.server.address().port; resolve(this); });
     });
   }
 
@@ -119,6 +123,7 @@ class FakeServer {
   }
 
   _onConnection(sock) {
+    if (this.refuse) { sock.destroy(); return; }
     this.connections++;
     this.sockets.add(sock);
     sock.on('close', () => this.sockets.delete(sock));

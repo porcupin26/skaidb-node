@@ -9,7 +9,8 @@ modeled on [node-postgres (`pg`)](https://node-postgres.com/): `new Client(…)`
 - Speaks skaidb's binary protocol directly: SCRAM-SHA-256 auth, server-side
   prepared statements with typed parameters, streaming result sets, one-round-trip
   batches, full type fidelity (bigint, Decimal, UUID, Bytes, Timestamp, Array, Document).
-- Multi-seed failover, transparent reconnect, TLS, connection pooling.
+- Multi-seed failover, transparent reconnect, TLS, connection pooling balanced
+  across the cluster's members (policies, health ejection, discovery).
 
 Full documentation: this README, the [`docs/`](docs/) folder
 ([getting started](docs/getting-started.md) · [API reference](docs/api.md) ·
@@ -25,7 +26,7 @@ npm install @skaidb/client
 
 The package is `@skaidb/client` on the npm registry and is required as
 `@skaidb/client`. To install straight from GitHub instead, pin a tag with
-`npm install github:porcupin26/skaidb-node#v1.1.0` (`#main` follows the
+`npm install github:porcupin26/skaidb-node#v1.2.0` (`#main` follows the
 development branch); the module name is the same whatever the install
 source.
 
@@ -97,7 +98,8 @@ unhealthy does not swallow the attempt). If none works it throws
 `no reachable endpoint in <list>: <last error>`. Bare hosts take `port`.
 
 The same walk runs again on reconnect (below), so a client survives the node
-it was talking to going away.
+it was talking to going away. A pooled connection re-dials in the pool's
+order instead: usable members first, the one it just lost last.
 
 ### TLS modes
 
@@ -328,7 +330,69 @@ await pool.end();
 checked out: a burst opens extras and the surplus is closed on release.
 `acquire()` validates an idle connection before handing it out and discards
 one the server closed meanwhile; `release()` closes a broken connection
-instead of pooling it. Every `Client` option passes through.
+instead of pooling it. Every `Client` option passes through; `seeds` (or
+`host`/`port`) name the starting members.
+
+### Balancing across members
+
+By default (`loadBalancing: 'random'`) each new connection dials the members
+in random order and stays on the member it reached — fine for many
+processes, but one process can end up with most of its connections on one
+member. A policy spreads a single process's load:
+
+```js
+const pool = new Pool({
+  seeds: ['db1:7000', 'db2:7000', 'db3:7000'], user, password, database: 'app',
+  loadBalancing: 'least_latency',   // or 'round_robin'
+  discover: true,                   // learn the members from the cluster
+  readYourWrites: 2000,             // ms; see below
+  idleOrder: 'fifo',
+});
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `loadBalancing` | `'random'` | `'round_robin'`: checkouts rotate over the usable members in endpoint order. `'least_latency'`: of two members picked at random, the one with the lower round-trip average × (checked-out connections + 1), so near and idle members win; a member not measured in the last 2 s scores 0, so every member keeps being re-measured. |
+| `idleOrder` | `'lifo'` | `'fifo'` hands out the longest-idle connection first, so every idle connection keeps being used and a server-side idle timeout never finds one. |
+| `discover` | `false` | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) when a member is first reached and every `refreshInterval` (60000 ms) after — every 5 s while one is `resyncing` or `unreachable`. New members are added, members that left are dropped (seeds are kept, marked `unlisted`), and members reported `resyncing` or `unreachable` get no new connections until they are `ready` again, when they start with a fresh latency average. An older or standalone server leaves the seeds as they are and is not asked again. |
+| `ejectErrors` | `3` | Consecutive transport failures (a failed dial, an I/O error mid-request, a capacity refusal) that eject a member. Statement errors and refused logins do not count. |
+| `ejectLatencyFactor`, `ejectLatencyFloor` | `3`, `50` (ms) | A member whose round-trip average is above factor × the other members' median **and** more than floor ms above it is ejected (after 10 samples on it and on another member). Factor `0` disables. |
+| `ejectBackoff`, `ejectBackoffMax` | `5000`, `60000` (ms) | How long an ejection lasts, doubling per repeat (back to the base after a healthy `ejectBackoffMax`). When it is up, a background probe dials the member and runs one statement; success re-admits it. The last usable member is never ejected. |
+| `readYourWrites` | `0` (off) | Milliseconds after a write during which checkouts with the same `affinity` go to the member that took it. |
+
+**Read-your-writes.** The member that coordinated a write reads it back at
+any consistency, `ONE` included; another member may not have applied it yet.
+With `readYourWrites` set, pass an affinity key — a user or session id —
+when you check out:
+
+```js
+await pool.withConnection({ affinity: userId }, (c) =>
+  c.query('INSERT INTO notes (id, owner, body) VALUES ($1, $2, $3)', [id, userId, body]));
+// the next request for the same user, within the window, reaches the same member:
+const note = await pool.withConnection({ affinity: userId }, (c) =>
+  c.query('SELECT body FROM notes WHERE id = $1', [id]));
+const conn = await pool.acquire({ affinity: userId });   // acquire() takes it too
+```
+
+Checkouts without a key share one pool-wide key, so with constant writes
+everything follows the latest writer — pass a key when you balance. A
+statement is a write unless its first keyword is `SELECT`, `SHOW`,
+`EXPLAIN`, `DESCRIBE`/`DESC`, `VALUES`, `WITH` or `USE`.
+
+**Watching it.** `pool.members()` returns one entry per member, in endpoint
+order:
+
+```js
+[{ endpoint: 'db1:7000', canonical: '10.0.0.1:7000', state: 'ready',
+   latencyMs: 0.8, inUse: 2, idle: 3, seed: true }, ...]
+```
+
+`state` is `ready`, `ejected`, `resyncing`, `unreachable` or `unlisted`. The
+pool is an `EventEmitter`: `'eject'` (`{ endpoint, reason }`) and
+`'readmit'` (`{ endpoint }`) fire as members leave and rejoin the rotation.
+The probe/discovery timer is `unref()`'d, so it never keeps the process
+alive, and `pool.end()` stops it. The rules are the same in every skaidb
+driver ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)).
 
 ## Reconnect and errors
 
