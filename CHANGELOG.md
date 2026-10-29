@@ -4,6 +4,22 @@ All notable changes to the skaidb Node.js driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-10-29
+
+### Added
+- **Parameterised streaming**: `client.stream(sql, values, opts?)` binds
+  `$1, $2, …` exactly as `query(text, values)` does — typed, arrays and
+  documents included — over `OP_QUERY_STREAM_PARAMS` (server ≥ 0.330), so a
+  range-bounded export no longer needs its literals interpolated into the
+  SQL. The values may also go in the options (`opts.values`, which wins
+  over the argument, as `config.values` does for `query()`). Without values
+  the request is the original `OP_QUERY_STREAM`, byte for byte, so it works
+  against every server, and `stream(sql, opts)` is unchanged. Against an
+  older server a stream with values fails with `server does not support
+  parameterised streaming (skaidb >= 0.330): …`, and the connection stays
+  usable. The declarations gain `StreamOptions.values` and the
+  `(sql, values?, opts?)` call form.
+
 ## [1.2.0] - 2026-10-25
 
 ### Added

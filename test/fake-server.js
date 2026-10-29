@@ -78,6 +78,12 @@ function parseRequest(payload) {
       return { op, consistency, id, rows };
     }
     case 8: return { op, name: r.text(), version: r.text() };
+    case 9: {
+      const consistency = r.u8(); const sql = r.text(); const n = r.u16();
+      const params = [];
+      for (let i = 0; i < n; i++) params.push(I.decodeValue(new I.Reader(r.blob())));
+      return { op, consistency, sql, params };
+    }
     default: return { op, raw: payload };
   }
 }
@@ -179,6 +185,7 @@ class FakeServer {
       return;
     }
     const req = parseRequest(payload);
+    req.raw = payload;         // the exact bytes, for tests that check a request byte for byte
     this.requests.push(req);
     if (req.op === 8) this.hellos.push(req);
     let out = this.handle(req, conn);

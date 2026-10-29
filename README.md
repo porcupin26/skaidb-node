@@ -26,7 +26,7 @@ npm install @skaidb/client
 
 The package is `@skaidb/client` on the npm registry and is required as
 `@skaidb/client`. To install straight from GitHub instead, pin a tag with
-`npm install github:porcupin26/skaidb-node#v1.2.0` (`#main` follows the
+`npm install github:porcupin26/skaidb-node#v1.3.0` (`#main` follows the
 development branch); the module name is the same whatever the install
 source.
 
@@ -229,11 +229,15 @@ sent through `query()` on one connection (statements on a client are
 serialized, so they run in order). `batch()` rows autocommit one by one, as
 described above.
 
-## Streaming large results — `client.stream(sql, opts?)`
+## Streaming large results — `client.stream(sql, values?, opts?)`
 
 `query()` buffers the whole result; a large scan is also bounded by the
 server's scan budgets. `stream()` asks the server to deliver the rows in
-chunks and yields them one at a time, holding one chunk in memory:
+chunks and yields them one at a time, holding one chunk in memory. The
+server executes a plain `SELECT` page by page, and no scan budget applies to
+a streamed page (server ≥ 0.330; `EXPLAIN` says whether a statement pages,
+and [PROTOCOL.md §3.4](https://skaidb.org/docs/PROTOCOL.html#34-streaming-a-result-set)
+gives the rules):
 
 ```js
 for await (const row of client.stream('SELECT id, v FROM readings')) {
@@ -242,18 +246,34 @@ for await (const row of client.stream('SELECT id, v FROM readings')) {
 console.log(client.stream.columns);   // column names, set once the header arrives
 ```
 
-Options: `{ consistency, rowMode }`. It takes **no parameters** (the streaming
-opcode carries SQL text only). A non-row statement streamed this way yields
-nothing; `client.stream.command` is then `'MUTATION'` or `'DDL'`,
-`client.stream.affected` holds a mutation's affected-row count and
-`client.stream.columns` is `null` (a row result sets `command` to
-`'SELECT'`). Like `columns`, these describe the stream started most
-recently. An error before any row is an ordinary statement error; an error
-partway through (a node dying mid-scan, a scan budget tripping) is thrown
-after the rows already yielded, which are valid.
+`values` bind `$1, $2, …` exactly as `query(text, values)` binds them —
+typed, arrays and objects included:
 
-On a cluster, name the columns: a bare `SELECT *` is only executed page by
-page at consistency `ONE`; a named column list streams at any level.
+```js
+for await (const ev of client.stream(
+  'SELECT id, ts, body FROM events WHERE ts >= $1 AND ts < $2', [start, end])) {
+  save(ev);
+}
+```
+
+They travel with the statement in one request, which needs a server ≥
+0.330: an older one refuses it with `server does not support parameterised
+streaming (skaidb >= 0.330): …`, and the connection stays usable. A stream
+without values sends the original request and works against every server
+with streaming. Values bind the statement kinds that can be prepared
+(`SELECT`/`INSERT`/`UPDATE`/`DELETE`); unlike `query()`, a stream has no
+client-side quoting fallback for the others.
+
+Options: `{ consistency, rowMode, values }` — `values` given there wins
+over the argument, as `config.values` does for `query()`, and
+`stream(sql, opts)` is the call without values. A non-row statement
+streamed this way yields nothing; `client.stream.command` is then
+`'MUTATION'` or `'DDL'`, `client.stream.affected` holds a mutation's
+affected-row count and `client.stream.columns` is `null` (a row result sets
+`command` to `'SELECT'`). Like `columns`, these describe the stream started
+most recently. An error before any row is an ordinary statement error; an
+error partway through (a node dying mid-scan, a scan budget tripping) is
+thrown after the rows already yielded, which are valid.
 
 ### The abandon rule
 
@@ -420,7 +440,8 @@ Every error the driver raises is a `SkaidbError` (an `Error` subclass).
 Common messages: `connect failed: …`, `connect timeout`, `no reachable
 endpoint in …`, `authentication denied: …`, `server signature mismatch
 (mutual auth failed)`, `cannot read tlsCa …`, `cannot read tlsClientCert …`, `server does not support
-streaming: …`, `statement expects N parameters, got M`, `no parameter for
+streaming: …`, `server does not support parameterised streaming (skaidb >=
+0.330): …`, `statement expects N parameters, got M`, `no parameter for
 $N`, `cannot bind value of type …`, `cannot bind NaN/Infinity`, `bigint …
 does not fit a 64-bit integer`, `stream abandoned with too much data left to
 drain`.
@@ -452,7 +473,9 @@ arrays/objects cannot be bound at all.
 - **Server**: any skaidb. Prepared statements need server ≥ 0.17.0 (older
   servers get the client-side fallback automatically), `batch()` ≥ 0.87.0,
   `stream()` a server with the streaming opcode (an older one answers `server
-  does not support streaming`), multiple result sets a server with `EMIT`.
+  does not support streaming`) and, with values, ≥ 0.330 (an older one
+  answers `server does not support parameterised streaming`), multiple
+  result sets a server with `EMIT`.
   The Hello frame that fills the server's `drivers` table (`client_name`
   `nodejs`, `client_version` = this package's version) is ignored by older
   servers.
@@ -470,9 +493,9 @@ part of `npm test`:
 - the SCRAM vectors against the driver's own SCRAM code;
 - a scripted fake server that verifies the client proof independently,
   checks every request byte for byte and replays the reference responses,
-  for every case through the public API (`query`, `stream`, parameterized
-  `query`, `batch`), plus the auth outcomes (ok, a bad server signature
-  must fail, denied).
+  for every case through the public API (`query`, `stream` with and
+  without values, parameterized `query`, `batch`), plus the auth outcomes
+  (ok, a bad server signature must fail, denied).
 
 Skipped: no call method. Encoding is not checked for the values JavaScript
 has no parameter form for: Decimal and Uuid (they surface as strings, which

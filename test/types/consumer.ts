@@ -5,7 +5,7 @@
 
 import {
   Client, Pool, SkaidbError, CONSISTENCY,
-  ClientOptions, PoolOptions, QueryResult, QueryConfig, StreamEvent, Value, Consistency,
+  ClientOptions, PoolOptions, QueryResult, QueryConfig, StreamEvent, StreamOptions, Value, Consistency,
   AuthMechanism, BatchOptions, LoadBalancing, IdleOrder, MemberState, PoolMember, AcquireOptions,
   EjectEvent, ReadmitEvent,
 } from '@skaidb/client';
@@ -64,6 +64,23 @@ async function main(): Promise<void> {
     void cells[0];
     break;
   }
+
+  // stream() with values: `$1, $2, …` as in query(), as the second argument
+  // (with or without options) or in the options.
+  for await (const row of client.stream<User>('SELECT id, name, tags FROM users WHERE id > $1', [10])) {
+    const id: number = row.id;
+    if (id > 10) break;
+  }
+  for await (const cells of client.stream<Value[]>(
+    'SELECT id FROM users WHERE tags = $1 AND seen < $2', [['a'], new Date()], { rowMode: 'array', consistency: 'ONE' })) {
+    void cells[0];
+    break;
+  }
+  const streamOpts: StreamOptions = { values: [1n, null, { k: 'v' }], consistency: 'ALL' };
+  for await (const _ of client.stream('SELECT id FROM users WHERE id = $1', streamOpts)) break;
+  for await (const _ of client.stream('SELECT id FROM users', null, { rowMode: 'array' })) break;
+  // @ts-expect-error values are an array, not a single value
+  void client.stream('SELECT id FROM users WHERE id = $1', 1);
 
   // subscribe(): stream events with a resumable cursor. Ids are opaque
   // STRINGS that sort in log order, never numbers.

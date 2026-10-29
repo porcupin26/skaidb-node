@@ -240,6 +240,36 @@ function encodeInto(v, parts) {
   throw new SkaidbError(`cannot bind value of type ${typeof v}`);
 }
 
+/**
+ * The request `stream()` sends. When the statement binds at least one value
+ * it is OP_QUERY_STREAM_PARAMS (9): the SQL with `$N` rewritten to `?`, then
+ * the typed parameter vector OP_EXECUTE carries, in `?` order. Otherwise it
+ * is the original OP_QUERY_STREAM (5) with the SQL exactly as given, which
+ * every server with streaming understands: `$N` is only rewritten when
+ * values are given, as in query().
+ */
+function streamRequest(sql, values, consistency) {
+  if (values !== undefined && values !== null && !Array.isArray(values)) {
+    throw new SkaidbError('stream() values must be an array');
+  }
+  const q = values && values.length ? toQmark(sql, values) : { sql, params: [] };
+  const body = Buffer.from(q.sql, 'utf8');
+  const head = Buffer.allocUnsafe(6);
+  head[0] = q.params.length ? 9 : 5; head[1] = consistency; head.writeUInt32LE(body.length, 2);
+  if (q.params.length === 0) return Buffer.concat([head, body]);
+  // The count is a u16 on the wire: refuse more as a SkaidbError rather than
+  // let writeUInt16LE throw a RangeError. (query() learns the count from its
+  // prepare reply, which could not match.)
+  if (q.params.length > 0xffff) {
+    throw new SkaidbError(`too many parameters: ${q.params.length} (a statement binds at most 65535)`);
+  }
+  const count = Buffer.allocUnsafe(2);
+  count.writeUInt16LE(q.params.length, 0);
+  const parts = [head, body, count];
+  for (const p of q.params) { const v = encodeValue(p); parts.push(u32le(v.length), v); }
+  return Buffer.concat(parts);
+}
+
 function bindParams(sql, params) {
   if (!params || params.length === 0) return sql;
   // Replace $N outside string literals.
@@ -711,6 +741,17 @@ class Client {
    * chunk, instead of buffering the whole set. For exports and large scans.
    *
    *   for await (const row of client.stream('SELECT ...')) { ... }
+   *   for await (const row of client.stream('SELECT ... WHERE ts >= $1', [since])) { ... }
+   *
+   * `values` bind `$1, $2, …` exactly as query(text, values) binds them —
+   * typed, arrays and objects included — and travel with the statement in
+   * OP_QUERY_STREAM_PARAMS (server >= 0.330; an older one refuses it with
+   * "server does not support parameterised streaming"). Without values the
+   * request is the original OP_QUERY_STREAM, byte for byte, so a
+   * parameterless stream works against every server. `opts` is
+   * { values?, consistency?, rowMode? }: `opts.values` wins over the
+   * argument, as `config.values` does in query(), and stream(sql, opts) —
+   * the form from before stream() took values — is unchanged.
    *
    * Column names land on `client.stream.columns` once the header arrives.
    * A statement that produces no rows (UPDATE, DELETE, DDL) yields nothing;
@@ -719,7 +760,7 @@ class Client {
    * (`columns` is null). A row result sets `command` to `'SELECT'`. Those
    * slots live on the shared method, not on the iterator, so they describe
    * whichever stream started most recently — read them before starting
-   * another. Takes no parameters: the streaming opcode carries SQL text.
+   * another.
    *
    * The connection is busy for the whole stream, and CLOSING the iterator is
    * what frees it. `break`, `return`, a throw out of the loop body and an
@@ -729,10 +770,22 @@ class Client {
    * do it — and that connection stays busy for good, so always iterate to
    * the end or close it.
    */
-  async *stream(sql, opts = {}) {
+  async *stream(sql, values, opts) {
+    // stream(sql, opts), the call form from before values existed: only an
+    // array (or nothing) is values, so any other second argument is still
+    // read as the options it always was.
+    if (opts === undefined && values !== undefined && values !== null && !Array.isArray(values)) {
+      opts = values;
+      values = undefined;
+    }
+    if (opts === undefined || opts === null) opts = {};
     const consistency = opts.consistency === undefined
       ? this.consistency : resolveConsistency(opts.consistency);
     const rowMode = opts.rowMode || 'object';
+    // Built before the stream takes the connection: a value that cannot be
+    // bound (`$3` with two values, a `?`, NaN) rejects without waiting
+    // behind other statements or sending anything.
+    const request = streamRequest(sql, opts.values || values, consistency);
     // Hold the query chain for the WHOLE stream rather than per frame, so
     // no other statement can interleave its frames with ours. Concurrency
     // choice: a query()/batch() call made meanwhile QUEUES behind the stream
@@ -757,15 +810,15 @@ class Client {
       this.stream.columns = null;
       this.stream.command = null;
       this.stream.affected = null;
-      const body = Buffer.from(sql, 'utf8');
-      const head = Buffer.allocUnsafe(6);
-      head[0] = 5; head[1] = consistency; head.writeUInt32LE(body.length, 2);
-      const first = new Reader(await this._request(Buffer.concat([head, body])));
+      const first = new Reader(await this._request(request));
       const tag = first.u8();
       if (tag === 3) {
+        // One ordinary Error frame: the connection is at a request boundary.
         const msg = first.text();
-        throw statementError(msg.includes('unknown opcode')
-          ? `server does not support streaming: ${msg}` : msg);
+        if (!msg.includes('unknown opcode')) throw statementError(msg);
+        throw statementError(request[0] === 9            // OP_QUERY_STREAM_PARAMS
+          ? `server does not support parameterised streaming (skaidb >= 0.330): ${msg}`
+          : `server does not support streaming: ${msg}`);
       }
       this._noteStatement(sql);
       if (tag === 1) {                         // mutation: no rows, a count

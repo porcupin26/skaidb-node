@@ -113,6 +113,11 @@ export interface QueryResult<Row = any> {
 }
 
 export interface StreamOptions {
+  /**
+   * Parameters for `$1, $2, …` placeholders, as in `QueryConfig.values`.
+   * Overrides the `values` argument of `stream()`.
+   */
+  values?: Value[];
   /** Consistency for this statement only. */
   consistency?: Consistency;
   /** `'array'` yields cell arrays instead of objects. Default `'object'`. */
@@ -125,12 +130,19 @@ export interface BatchOptions {
 }
 
 /**
- * `client.stream(sql)` — an async generator over the rows of one statement.
- * The slots below describe the stream started MOST RECENTLY (they live on
- * the method, not the iterator).
+ * `client.stream(sql, values?, opts?)` — an async generator over the rows of
+ * one statement; `stream(sql, opts)` is the same without values. The slots
+ * below describe the stream started MOST RECENTLY (they live on the method,
+ * not the iterator).
  */
 export interface StreamFunction {
   <Row = any>(sql: string, opts?: StreamOptions): AsyncGenerator<Row, void, undefined>;
+  /**
+   * `values` bind `$1, $2, …` as `query(text, values)` binds them, sent with
+   * the statement in one request (server ≥ 0.330). Without any, the request
+   * is the one every server with streaming understands.
+   */
+  <Row = any>(sql: string, values?: Value[] | null, opts?: StreamOptions): AsyncGenerator<Row, void, undefined>;
   /** Column names once the header arrives; `null` for a statement without rows. */
   columns?: string[] | null;
   /** `'SELECT'` for rows, `'MUTATION'` or `'DDL'` for a statement that yields none. */
@@ -213,10 +225,12 @@ export class Client {
   batch(sql: string, rows: Value[][], opts?: BatchOptions): Promise<number>;
 
   /**
-   * Stream a result set row by row while holding one chunk in memory. The
-   * connection is busy until the iterator is exhausted or closed (`break`,
-   * `return`, a throw, or `.return()`); closing early drains or drops the
-   * connection so it is left at a request boundary. Never leak an iterator.
+   * Stream a result set row by row while holding one chunk in memory:
+   * `stream(sql, values?, opts?)`, `values` binding `$1, $2, …` as in
+   * `query()` (server ≥ 0.330). The connection is busy until the iterator is
+   * exhausted or closed (`break`, `return`, a throw, or `.return()`);
+   * closing early drains or drops the connection so it is left at a request
+   * boundary. Never leak an iterator.
    */
   stream: StreamFunction;
 

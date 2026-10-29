@@ -21,11 +21,18 @@ const [host = 'localhost', port = '7000', user = 'anonymous', password = ''] = p
   for (let i = 1; i <= 5000; i++) rows.push([i, Math.sin(i / 100)]);
   await client.batch('INSERT INTO readings (id, v) VALUES ($1, $2)', rows);
 
-  // Full scan, one chunk in memory at a time. Name the columns: on a cluster
-  // a bare `SELECT *` only streams page by page at consistency ONE.
+  // Full scan, one chunk in memory at a time. The server pages a plain
+  // SELECT like this one, and no scan budget applies to a page (server >= 0.330).
   let n = 0, sum = 0;
   for await (const row of client.stream('SELECT id, v FROM readings')) { n++; sum += row.v; }
   console.log('columns', client.stream.columns, 'rows', n, 'mean', sum / n);
+
+  // A range: values bind $1, $2, … exactly as in query() (server >= 0.330).
+  let inRange = 0;
+  for await (const _ of client.stream('SELECT id, v FROM readings WHERE id > $1 AND id <= $2', [1000, 2000])) {
+    inRange++;
+  }
+  console.log('rows in (1000, 2000]', inRange);
 
   // Stop early: `break` closes the iterator and the driver cleans up.
   for await (const row of client.stream('SELECT id, v FROM readings', { rowMode: 'array' })) {

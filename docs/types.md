@@ -3,8 +3,8 @@
 ## Value mapping
 
 Results decode from skaidb's typed wire values; parameters encode back to
-them when a statement is prepared (which is the normal path whenever you
-pass values).
+them whenever you pass values: to a statement `query()` or `batch()`
+prepares (the normal path), and to `stream()`.
 
 | skaidb type | Result value | Accepted as a parameter |
 |---|---|---|
@@ -79,8 +79,9 @@ object form of `query()`; `QueryResult<Row>` every result (with optional
 `StreamEvent` the streaming APIs. `Consistency` is
 `0 | 1 | 2 | 'ONE' | 'QUORUM' | 'ALL'` (lowercase names also accepted).
 
-`client.stream` is declared as a callable with an optional `columns:
-string[]` property, matching the runtime.
+`client.stream` is declared as a callable — `(sql, opts?)` and
+`(sql, values?, opts?)` — with optional `columns`, `command` and `affected`
+properties, matching the runtime.
 
 ### Errors
 

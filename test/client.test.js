@@ -5,20 +5,20 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const net = require('net');
-const { Client, Pool, SkaidbError } = require('../skaidb');
+const { Client, Pool, SkaidbError, _internal: I } = require('../skaidb');
 const pkg = require('../package.json');
 const { FakeServer, F } = require('./fake-server');
 
-// A scripted handler: `script[sql]` answers OP_QUERY / OP_QUERY_STREAM text,
-// `prepared[sql]` makes OP_PREPARE succeed with that arity, executes answer
-// through `onExecute`.
+// A scripted handler: `script[sql]` answers OP_QUERY / OP_QUERY_STREAM text
+// and OP_QUERY_STREAM_PARAMS (by its `?` text), `prepared[sql]` makes
+// OP_PREPARE succeed with that arity, executes answer through `onExecute`.
 function scripted(script, extra = {}) {
   const prepared = extra.prepared || {};
   let nextId = 100;
   const ids = new Map();
   return (req, conn) => {
     switch (req.op) {
-      case 1: case 5: {
+      case 1: case 5: case 9: {
         const a = script[req.sql];
         if (a === undefined) return F.error(`fake server: unknown statement ${req.sql}`);
         return typeof a === 'function' ? a(req, conn) : a;
@@ -56,7 +56,7 @@ test('connect runs SCRAM, verifies the server signature and sends Hello with the
     assert.equal(srv.hellos.length, 1);
     assert.equal(srv.hellos[0].name, 'nodejs');
     assert.equal(srv.hellos[0].version, pkg.version);
-    assert.equal(pkg.version, '1.2.0');
+    assert.equal(pkg.version, '1.3.0');
     await c.end();
     assert.equal(c.isUsable(), false);
   });
@@ -299,6 +299,165 @@ test('statements on one client are serialized, even around a stream', async () =
     assert.equal(settled, false);
     await it.return();
     assert.deepEqual((await queued).rows, [{ v: 42 }]);
+    await c.end();
+  });
+});
+
+// Every row a stream yields (a rejection if it throws).
+const collect = async (it) => { const rows = []; for await (const r of it) rows.push(r); return rows; };
+
+// OP_QUERY_STREAM exactly as a stream without values has always sent it.
+const queryStreamBytes = (consistency, sql) => {
+  const b = Buffer.from(sql, 'utf8');
+  return Buffer.concat([Buffer.from([5, consistency]), I.u32le(b.length), b]);
+};
+
+test('stream with values sends one OP_QUERY_STREAM_PARAMS: the ? text, then the parameter vector OP_EXECUTE carries', async () => {
+  const sql = 'SELECT id FROM t WHERE ts >= ? AND tag = ? AND tags = ? AND meta = ? AND gone = ? AND big = ?';
+  const script = {
+    [sql]: [F.header(['id']), F.chunk([[7], [8]]), F.chunk([[9]]), F.end()],
+    'SELECT b, a, c FROM t WHERE b = ? AND a = ? OR c = ?': (req) => [F.header(['b', 'a', 'c']), F.chunk([req.params]), F.end()],
+    'SELECT 42': F.rows(['v'], [[42]]),
+  };
+  await withServer({ handle: scripted(script) }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const text = 'SELECT id FROM t WHERE ts >= $1 AND tag = $2 AND tags = $3 AND meta = $4 AND gone = $5 AND big = $6';
+    const values = [new Date(5), "o'neil", ['a', 'b'], { k: 1.5, n: null }, null, 2n ** 62n];
+    assert.deepEqual(await collect(c.stream(text, values)), [{ id: 7 }, { id: 8 }, { id: 9 }]);
+    assert.deepEqual(c.stream.columns, ['id']);
+    assert.equal(c.stream.command, 'SELECT');
+    const req = srv.requests.find((q) => q.op === 9);
+    // Built independently: opcode 9, the consistency (the client's QUORUM),
+    // the u32 length and the `?` text, the u16 count, each value length-prefixed.
+    const body = Buffer.from(sql, 'utf8');
+    const count = Buffer.alloc(2); count.writeUInt16LE(values.length, 0);
+    const want = [Buffer.from([9, 1]), I.u32le(body.length), body, count];
+    for (const v of values) { const b = I.encodeValue(v); want.push(I.u32le(b.length), b); }
+    assert.deepEqual(req.raw, Buffer.concat(want));
+    assert.deepEqual(req.params, values);                            // typed, lossless
+    assert.equal(srv.requests.filter((q) => q.op === 2 || q.op === 3).length, 0);   // one request, no prepare
+    // `$N` in wire order (a repeat travels twice); a per-statement consistency and rowMode.
+    assert.deepEqual(await collect(c.stream('SELECT b, a, c FROM t WHERE b = $2 AND a = $1 OR c = $2', ['x', 'y'],
+      { consistency: 'ONE', rowMode: 'array' })), [['y', 'x', 'y']]);
+    assert.equal(srv.requests[srv.requests.length - 1].consistency, 0);
+    // Abandoned early, it drains like any stream: same connection, the next reply its own.
+    for await (const row of c.stream(text, values)) { assert.deepEqual(row, { id: 7 }); break; }
+    assert.deepEqual((await c.query('SELECT 42')).rows, [{ v: 42 }]);
+    assert.equal(srv.connections, 1);
+    await c.end();
+  });
+});
+
+test('stream without values sends the original OP_QUERY_STREAM byte for byte, in every call form', async () => {
+  const script = {
+    'SELECT id FROM t': (req) => [F.header(['id', 'c']), F.chunk([[1, req.consistency]]), F.end()],
+    "SELECT '$1', $1": [F.header(['a']), F.end()],
+  };
+  await withServer({ handle: scripted(script) }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret', consistency: 'ALL' });
+    await c.connect();
+    const sent = () => srv.requests[srv.requests.length - 1].raw;
+    // The forms from before stream() took values: (sql) and (sql, opts).
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t')), [{ id: 1, c: 2 }]);
+    assert.deepEqual(sent(), queryStreamBytes(2, 'SELECT id FROM t'));
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t', { consistency: 'ONE' })), [{ id: 1, c: 0 }]);
+    assert.deepEqual(sent(), queryStreamBytes(0, 'SELECT id FROM t'));
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t', { rowMode: 'array' })), [[1, 2]]);
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t', { consistency: 'quorum', rowMode: 'array' })), [[1, 1]]);
+    assert.deepEqual(sent(), queryStreamBytes(1, 'SELECT id FROM t'));
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t', {})), [{ id: 1, c: 2 }]);
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t', undefined)), [{ id: 1, c: 2 }]);
+    assert.deepEqual(sent(), queryStreamBytes(2, 'SELECT id FROM t'));
+    // Nothing to bind is the same request: no values, or values the text
+    // never references (ignored, as query() ignores them).
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t', [])), [{ id: 1, c: 2 }]);
+    assert.deepEqual(sent(), queryStreamBytes(2, 'SELECT id FROM t'));
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t', null, { rowMode: 'array' })), [[1, 2]]);
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t', [], { consistency: 'ONE' })), [{ id: 1, c: 0 }]);
+    assert.deepEqual(sent(), queryStreamBytes(0, 'SELECT id FROM t'));
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t', [5])), [{ id: 1, c: 2 }]);
+    assert.deepEqual(sent(), queryStreamBytes(2, 'SELECT id FROM t'));
+    // Without values `$N` is left alone: the text goes out exactly as given.
+    assert.deepEqual(await collect(c.stream("SELECT '$1', $1")), []);
+    assert.deepEqual(sent(), queryStreamBytes(2, "SELECT '$1', $1"));
+    assert.equal(srv.requests.filter((q) => q.op === 9).length, 0);
+    await c.end();
+  });
+});
+
+test('stream takes values as its second argument or in opts; opts.values wins, as config.values does for query()', async () => {
+  const script = { 'SELECT v FROM t WHERE id > ?': (req) => [F.header(['v']), F.chunk([[req.params[0]]]), F.end()] };
+  await withServer({ handle: scripted(script) }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const text = 'SELECT v FROM t WHERE id > $1';
+    assert.deepEqual(await collect(c.stream(text, [3])), [{ v: 3 }]);
+    assert.deepEqual(await collect(c.stream(text, { values: [4], rowMode: 'array' })), [[4]]);
+    assert.deepEqual(await collect(c.stream(text, [1], { values: [5] })), [{ v: 5 }]);
+    assert.deepEqual(await collect(c.stream(text, null, { values: [6], consistency: 'ALL' })), [{ v: 6 }]);
+    const last = srv.requests[srv.requests.length - 1];
+    assert.deepEqual([last.op, last.consistency], [9, 2]);
+    await c.end();
+  });
+});
+
+test('a server older than 0.330 refuses a stream with values; the error says so and the connection stays usable', async () => {
+  const unknown = 'protocol error: malformed message: unknown opcode';
+  const knows = { params: false, streaming: true };        // what the server understands
+  const handle = (req) => {
+    if ((req.op === 9 && !knows.params) || (req.op === 5 && !knows.streaming)) return F.error(unknown);
+    if (req.op === 9) return F.error('statement expects 2 parameters, got 1');
+    if (req.op === 5) return [F.header(['id']), F.chunk([[1]]), F.end()];
+    if (req.op === 1) return F.rows(['v'], [[42]]);
+    return undefined;                                       // Hello -> Ddl
+  };
+  await withServer({ handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    let refused;
+    await assert.rejects(collect(c.stream('SELECT id FROM t WHERE id > $1', [1])), (e) => {
+      refused = e;
+      return e instanceof SkaidbError
+        && e.message === `server does not support parameterised streaming (skaidb >= 0.330): ${unknown}`;
+    });
+    assert.equal(I.memberFault(refused), false);            // a statement error, not the member's fault
+    assert.equal(c.isUsable(), true);
+    assert.equal(c.stream.columns, null);
+    // The same connection carries on: a stream without values works, so does a query.
+    assert.deepEqual(await collect(c.stream('SELECT id FROM t')), [{ id: 1 }]);
+    assert.deepEqual((await c.query('SELECT 42')).rows, [{ v: 42 }]);
+    // A server that knows the opcode: its errors arrive as they are.
+    knows.params = true;
+    await assert.rejects(collect(c.stream('SELECT id FROM t WHERE id > $1', [1])),
+      (e) => e instanceof SkaidbError && e.message === 'statement expects 2 parameters, got 1');
+    // One without streaming at all keeps its own message.
+    knows.streaming = false;
+    await assert.rejects(collect(c.stream('SELECT id FROM t')),
+      (e) => e instanceof SkaidbError && e.message === `server does not support streaming: ${unknown}`);
+    assert.equal(c.isUsable(), true);
+    assert.equal(srv.connections, 1);
+    await c.end();
+  });
+});
+
+test('stream rejects values it cannot bind before sending anything', async () => {
+  await withServer({}, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const before = srv.requests.length;
+    await assert.rejects(collect(c.stream('SELECT * FROM t WHERE id = ?', [1])),
+      (e) => e instanceof SkaidbError
+        && e.message === "this driver uses $1, $2 … placeholders; '?' is not a placeholder");
+    await assert.rejects(collect(c.stream('SELECT $1, $3', [1, 2])), /no parameter for \$3/);
+    await assert.rejects(collect(c.stream('SELECT $1', [NaN])), /cannot bind NaN\/Infinity/);
+    await assert.rejects(collect(c.stream('SELECT $1', { consistency: 'ONE' }, { rowMode: 'array' })),
+      (e) => e instanceof SkaidbError && e.message === 'stream() values must be an array');
+    await assert.rejects(collect(c.stream(`SELECT ${Array(65536).fill('$1').join(', ')}`, [1])),
+      (e) => e instanceof SkaidbError && e.message.startsWith('too many parameters: 65536'));
+    assert.equal(srv.requests.length, before);                   // nothing reached the server
+    assert.equal(c.isUsable(), true);
+    assert.equal((await c.query('SELECT 1')).command, 'DDL');    // the chain is alive
     await c.end();
   });
 });

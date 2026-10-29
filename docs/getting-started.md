@@ -15,7 +15,7 @@ npm install @skaidb/client
 ```
 
 The package is `@skaidb/client`, so it is required as `@skaidb/client`. To
-install from GitHub instead, `npm install github:porcupin26/skaidb-node#v1.2.0`
+install from GitHub instead, `npm install github:porcupin26/skaidb-node#v1.3.0`
 pins a tag and `#main` follows the development branch; the module name is
 the same either way.
 
@@ -114,6 +114,9 @@ probes them back in. See [the pool reference](api.md#new-pooloptions).
 ```js
 for await (const row of client.stream('SELECT id, name FROM users')) {
   // one row at a time, one chunk in memory
+}
+for await (const row of client.stream('SELECT id, name FROM users WHERE id > $1', [1000])) {
+  // values bind $1, $2, … as in query() (server ≥ 0.330)
 }
 ```
 

@@ -114,12 +114,30 @@ result is the total affected count.
 - The whole request must fit one 64 MiB frame; split very large batches.
 - `rows = []` resolves to `0` without a round-trip.
 
-### `client.stream(sql, opts?)` → `AsyncGenerator<Row>`
+### `client.stream(sql, values?, opts?)` → `AsyncGenerator<Row>`
 
-`opts = { consistency?, rowMode? }`. Yields the statement's rows one at a
-time while holding a single server chunk in memory. Takes no parameters:
-interpolate values yourself, or select by key with `query()`.
+`opts = { values?, consistency?, rowMode? }`. Yields the statement's rows
+one at a time while holding a single server chunk in memory. The server
+executes a plain `SELECT` page by page, and no scan budget applies to a
+streamed page (server ≥ 0.330; `EXPLAIN` says whether a statement pages).
 
+- `values` bind `$1, $2, …` by the [same rules as `query()`](#parameters):
+  typed bindings, a placeholder may repeat, `$N` inside a string literal is
+  text, extra values are ignored, and a placeholder without a value (`no
+  parameter for $N`) or a bare `?` rejects before anything is sent.
+  `opts.values` wins over the argument, as `config.values` does for
+  `query()`; `stream(sql, opts)` is the call without values.
+- With at least one value bound, the statement and its typed values travel
+  in one request, `OP_QUERY_STREAM_PARAMS` (server ≥ 0.330), with no
+  prepare round trip. Only the statement kinds that can be prepared take
+  values, and there is no client-side quoting fallback. A server older than
+  0.330 rejects it with `server does not support parameterised streaming
+  (skaidb >= 0.330): …`, a statement error that leaves the connection
+  usable.
+- Without values (none given, `[]`, or none that the text references) the
+  request is the original `OP_QUERY_STREAM` with the SQL exactly as given,
+  which every server with streaming understands; one without streaming
+  answers `server does not support streaming: …`.
 - `client.stream.columns` holds the column names once the header has
   arrived. The slot is on the method, not the iterator, so it describes the
   stream started most recently; so do `command` and `affected` below.
@@ -134,8 +152,6 @@ interpolate values yourself, or select by key with `query()`.
 - A `CALL` that EMITs cannot be streamed (the reply is one frame); it throws
   `unexpected response tag 8`, and the connection is dropped and re-dialled
   on the next statement.
-- On a cluster, a bare `SELECT *` streams page by page only at consistency
-  `ONE`; a named column list streams at any level.
 - `query()`/`batch()` calls made while a stream is open queue behind it.
 
 #### The abandon rule
@@ -299,5 +315,5 @@ with an error that the driver ignores.
 The driver implements the binary protocol specified at
 <https://skaidb.org/docs/PROTOCOL.html>: big-endian length-prefixed frames,
 the four-frame SCRAM-SHA-256 handshake with mutual authentication, opcodes
-`QUERY`, `PREPARE`, `EXECUTE`, `QUERY_STREAM`, `EXECUTE_BATCH` and `HELLO`,
-and the self-describing value encoding.
+`QUERY`, `PREPARE`, `EXECUTE`, `QUERY_STREAM`, `QUERY_STREAM_PARAMS`,
+`EXECUTE_BATCH` and `HELLO`, and the self-describing value encoding.

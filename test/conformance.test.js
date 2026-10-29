@@ -298,9 +298,15 @@ async function runCall(client, call) {
       return outcome(async () => {
         const opts = { rowMode: 'array' };
         if (call.consistency !== undefined) opts.consistency = call.consistency;
+        // With `call.params`, the call with values (`?` given as `$N`, as for
+        // execute_prepared); without, the call form that predates them.
+        const params = (call.params || []).map(native);
+        const iter = params.length
+          ? client.stream(dollarPlaceholders(call.sql), params, opts)
+          : client.stream(call.sql, opts);
         const rows = [];
         try {
-          for await (const row of client.stream(call.sql, opts)) rows.push(row);
+          for await (const row of iter) rows.push(row);
         } catch (e) {
           if (!(e instanceof SkaidbError) || client.stream.columns === null) throw e;
           return { rows_then_error: { rows: { columns: client.stream.columns, rows }, error: e.message } };
