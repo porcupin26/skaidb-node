@@ -313,6 +313,16 @@ async function runCall(client, call) {
         }
         if (client.stream.command === 'MUTATION') return { affected: String(client.stream.affected) };
         if (client.stream.command === 'DDL') return { ddl: true };
+        // A CALL that EMITs several sets: stream.resultSets carries every set
+        // in order, as query()'s resultSets does, and the rows the loop walked
+        // must be the last one's (the call's final result).
+        const sets = client.stream.resultSets;
+        if (sets && sets.length > 1) {
+          const last = sets[sets.length - 1];
+          assert.deepStrictEqual({ columns: client.stream.columns, rows }, { columns: last.columns, rows: last.rows },
+            'the streamed rows are not the last result set');
+          return { result_sets: sets.map((s) => ({ columns: s.columns, rows: s.rows })) };
+        }
         return { rows: { columns: client.stream.columns, rows } };
       });
     case 'execute_prepared':
