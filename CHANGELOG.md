@@ -4,6 +4,24 @@ All notable changes to the skaidb Node.js driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-10-29
+
+### Fixed
+- A streamed `CALL` whose procedure body `EMIT`s result sets returns them.
+  The server answers such a call with every set in one `ResultSets` frame
+  (tag 8) even to a stream request, and `client.stream()`, with or without
+  values, rejected that frame (`unexpected response tag 8 to stream
+  request`) and dropped the connection. The frame is now decoded by the
+  code `query()` uses: the stream yields the rows `query()` would return
+  (the call's final result, the last set), `client.stream.command` is
+  `'CALL'`, and the new `client.stream.resultSets` slot holds every set in
+  emission order, exactly as `query()`'s `resultSets` does (`null` for
+  every other statement). The exchange is complete in that one frame, so
+  nothing is drained and the connection is free before the first row is
+  yielded: a statement awaited inside the loop runs rather than queueing
+  behind the stream. The declarations gain
+  `StreamFunction.resultSets` and `'CALL'` in `StreamFunction.command`.
+
 ## [1.3.0] - 2026-10-29
 
 ### Added

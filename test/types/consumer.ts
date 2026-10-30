@@ -57,9 +57,10 @@ async function main(): Promise<void> {
   }
   const streamCols: string[] | null | undefined = client.stream.columns;
   for await (const _ of client.stream('DELETE FROM users WHERE id = 0')) { /* yields nothing */ }
-  const streamCommand: 'SELECT' | 'MUTATION' | 'DDL' | null | undefined = client.stream.command;
+  const streamCommand: 'SELECT' | 'MUTATION' | 'DDL' | 'CALL' | null | undefined = client.stream.command;
   const streamAffected: number | bigint | null | undefined = client.stream.affected;
-  void [streamCommand, streamAffected];
+  const streamSets: QueryResult[] | null | undefined = client.stream.resultSets;
+  void [streamCommand, streamAffected, streamSets];
   for await (const cells of client.stream<Value[]>('SELECT id FROM users', { rowMode: 'array' })) {
     void cells[0];
     break;

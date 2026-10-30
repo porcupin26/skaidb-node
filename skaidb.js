@@ -299,6 +299,45 @@ function bindParams(sql, params) {
   return out;
 }
 
+// ---- result decoding (§3.2) -------------------------------------------------
+
+/** A Rows body, also one set of ResultSets; `r` sits just past the tag. */
+function readRows(r, rowMode) {
+  const ncols = r.u32();
+  const fields = [];
+  for (let i = 0; i < ncols; i++) fields.push({ name: r.text() });
+  const nrows = r.u32();
+  const rows = [];
+  for (let i = 0; i < nrows; i++) {
+    const ncells = r.u32();
+    const cells = [];
+    for (let c = 0; c < ncells; c++) cells.push(decodeValue(new Reader(r.blob())));
+    if (rowMode === 'array') rows.push(cells);
+    else {
+      const obj = {};
+      for (let c = 0; c < ncells; c++) obj[fields[c].name] = cells[c];
+      rows.push(obj);
+    }
+  }
+  return { command: 'SELECT', rowCount: rows.length, rows, fields,
+           columns: fields.map((f) => f.name) };
+}
+
+/**
+ * A ResultSets body (a CALL whose body EMITted), `r` just past the tag. The
+ * buffered path and a stream request both receive this frame, and both
+ * decode it here: the LAST set (the call's final result) is the result's own
+ * rows; every set, in emission order, is under `resultSets`.
+ */
+function readResultSets(r, rowMode) {
+  const sets = [];
+  const nsets = r.u32();
+  for (let s = 0; s < nsets; s++) sets.push(readRows(r, rowMode));
+  const last = sets[sets.length - 1] || { rows: [], fields: [], columns: [], rowCount: 0 };
+  return { command: 'CALL', rowCount: last.rowCount, rows: last.rows, fields: last.fields,
+           columns: last.columns, resultSets: sets };
+}
+
 // ---- Connection / Client (pg-style) ---------------------------------------
 
 let nonceCounter = 0;
@@ -757,7 +796,12 @@ class Client {
    * A statement that produces no rows (UPDATE, DELETE, DDL) yields nothing;
    * `client.stream.command` then says `'MUTATION'` or `'DDL'` and
    * `client.stream.affected` holds a mutation's affected-row count
-   * (`columns` is null). A row result sets `command` to `'SELECT'`. Those
+   * (`columns` is null). A row result sets `command` to `'SELECT'`. A CALL
+   * whose body EMITs result sets is answered with all of them in one frame,
+   * streamed or not: the stream then yields the rows query() would return
+   * (the call's final result, the last set), `command` is `'CALL'`, and
+   * `client.stream.resultSets` holds every set, in emission order, exactly
+   * as query()'s `resultSets` does (null for every other statement). Those
    * slots live on the shared method, not on the iterator, so they describe
    * whichever stream started most recently — read them before starting
    * another.
@@ -810,6 +854,7 @@ class Client {
       this.stream.columns = null;
       this.stream.command = null;
       this.stream.affected = null;
+      this.stream.resultSets = null;
       const first = new Reader(await this._request(request));
       const tag = first.u8();
       if (tag === 3) {
@@ -827,6 +872,22 @@ class Client {
         return;
       }
       if (tag === 2) { this.stream.command = 'DDL'; return; }
+      if (tag === 8) {
+        // ResultSets: a CALL whose body EMITted is answered with every set
+        // in ONE frame, streamed or not — the frame query() receives,
+        // decoded by the same code. The exchange is over (nothing to drain),
+        // so this yields what query() calls the rows (the call's final
+        // result) and puts every set under `resultSets`, as query() does.
+        // The chain is let go first: a statement the loop body awaits runs
+        // instead of queueing behind a generator that waits on that body.
+        const res = readResultSets(first, rowMode);
+        this.stream.command = 'CALL';
+        this.stream.columns = res.columns;
+        this.stream.resultSets = res.resultSets;
+        release();
+        for (const row of res.rows) yield row;
+        return;
+      }
       if (tag !== 5) throw this._desync(`unexpected response tag ${tag} to stream request`);
       streaming = true;
       const ncols = first.u32();
@@ -976,55 +1037,8 @@ class Client {
     if (this._broken) throw new SkaidbError('connection lost');
     const r = new Reader(await this._request(request));
     const tag = r.u8();
-    if (tag === 0) {                            // Rows
-      const ncols = r.u32();
-      const fields = [];
-      for (let i = 0; i < ncols; i++) fields.push({ name: r.text() });
-      const nrows = r.u32();
-      const rows = [];
-      for (let i = 0; i < nrows; i++) {
-        const ncells = r.u32();
-        const cells = [];
-        for (let c = 0; c < ncells; c++) cells.push(decodeValue(new Reader(r.blob())));
-        if (rowMode === 'array') rows.push(cells);
-        else {
-          const obj = {};
-          for (let c = 0; c < ncells; c++) obj[fields[c].name] = cells[c];
-          rows.push(obj);
-        }
-      }
-      return { command: 'SELECT', rowCount: rows.length, rows, fields,
-               columns: fields.map((f) => f.name) };
-    }
-    if (tag === 8) {                            // ResultSets (a CALL with EMITs)
-      const sets = [];
-      const nsets = r.u32();
-      for (let s = 0; s < nsets; s++) {
-        const ncols = r.u32();
-        const fields = [];
-        for (let i = 0; i < ncols; i++) fields.push({ name: r.text() });
-        const nrows = r.u32();
-        const rows = [];
-        for (let i = 0; i < nrows; i++) {
-          const ncells = r.u32();
-          const cells = [];
-          for (let c = 0; c < ncells; c++) cells.push(decodeValue(new Reader(r.blob())));
-          if (rowMode === 'array') rows.push(cells);
-          else {
-            const obj = {};
-            for (let c = 0; c < ncells; c++) obj[fields[c].name] = cells[c];
-            rows.push(obj);
-          }
-        }
-        sets.push({ command: 'SELECT', rowCount: rows.length, rows, fields,
-                    columns: fields.map((f) => f.name) });
-      }
-      // The LAST set (the call's final result) is the result's own rows;
-      // every set, in emission order, is under `resultSets`.
-      const last = sets[sets.length - 1] || { rows: [], fields: [], columns: [], rowCount: 0 };
-      return { command: 'CALL', rowCount: last.rowCount, rows: last.rows, fields: last.fields,
-               columns: last.columns, resultSets: sets };
-    }
+    if (tag === 0) return readRows(r, rowMode);           // Rows
+    if (tag === 8) return readResultSets(r, rowMode);     // ResultSets (a CALL with EMITs)
     if (tag === 1) {                            // Mutation
       const affected = r.u64();
       return { command: 'MUTATION', rowCount: safeInt(affected), rows: [], fields: [] };

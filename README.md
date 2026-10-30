@@ -26,7 +26,7 @@ npm install @skaidb/client
 
 The package is `@skaidb/client` on the npm registry and is required as
 `@skaidb/client`. To install straight from GitHub instead, pin a tag with
-`npm install github:porcupin26/skaidb-node#v1.3.0` (`#main` follows the
+`npm install github:porcupin26/skaidb-node#v1.4.0` (`#main` follows the
 development branch); the module name is the same whatever the install
 source.
 
@@ -270,8 +270,11 @@ over the argument, as `config.values` does for `query()`, and
 streamed this way yields nothing; `client.stream.command` is then
 `'MUTATION'` or `'DDL'`, `client.stream.affected` holds a mutation's
 affected-row count and `client.stream.columns` is `null` (a row result sets
-`command` to `'SELECT'`). Like `columns`, these describe the stream started
-most recently. An error before any row is an ordinary statement error; an
+`command` to `'SELECT'`). A `CALL` whose body `EMIT`s result sets is answered
+with all of them in one frame even when streamed: the stream yields the rows
+`query()` would return (the last set), `command` is `'CALL'`, and
+`client.stream.resultSets` holds every set, as `query()`'s `resultSets` does.
+Like `columns`, these describe the stream started most recently. An error before any row is an ordinary statement error; an
 error partway through (a node dying mid-scan, a scan budget tripping) is
 thrown after the rows already yielded, which are valid.
 

@@ -140,7 +140,8 @@ streamed page (server ≥ 0.330; `EXPLAIN` says whether a statement pages).
   answers `server does not support streaming: …`.
 - `client.stream.columns` holds the column names once the header has
   arrived. The slot is on the method, not the iterator, so it describes the
-  stream started most recently; so do `command` and `affected` below.
+  stream started most recently; so do `command`, `affected` and
+  `resultSets` below.
 - A non-row statement (INSERT, DDL, USE) yields nothing. Afterwards
   `client.stream.command` is `'MUTATION'` or `'DDL'`,
   `client.stream.affected` holds a mutation's affected-row count (`null`
@@ -149,10 +150,16 @@ streamed page (server ≥ 0.330; `EXPLAIN` says whether a statement pages).
 - An error before any row rejects like `query()` would. An error after some
   rows (a node dying mid-scan, a scan budget tripping) is thrown from the
   iteration after those rows, which are valid; the connection stays usable.
-- A `CALL` that EMITs cannot be streamed (the reply is one frame); it throws
-  `unexpected response tag 8`, and the connection is dropped and re-dialled
-  on the next statement.
-- `query()`/`batch()` calls made while a stream is open queue behind it.
+- A `CALL` whose body EMITs result sets is answered with all of them in one
+  frame, streamed or not. The stream yields the rows `query()` would return
+  (the call's final result, the last set), `client.stream.command` is
+  `'CALL'`, `client.stream.columns` that set's columns, and
+  `client.stream.resultSets` holds every set in emission order, each a
+  `QueryResult` exactly as under `query()`'s `resultSets` (`null` for every
+  other statement). Nothing is left to drain, and the connection is free
+  before the first row is yielded.
+- `query()`/`batch()` calls made while a stream is open queue behind it
+  (except behind such a `CALL`, whose exchange is already over).
 
 #### The abandon rule
 

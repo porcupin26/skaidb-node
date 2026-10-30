@@ -56,7 +56,7 @@ test('connect runs SCRAM, verifies the server signature and sends Hello with the
     assert.equal(srv.hellos.length, 1);
     assert.equal(srv.hellos[0].name, 'nodejs');
     assert.equal(srv.hellos[0].version, pkg.version);
-    assert.equal(pkg.version, '1.3.0');
+    assert.equal(pkg.version, '1.4.0');
     await c.end();
     assert.equal(c.isUsable(), false);
   });
@@ -232,8 +232,59 @@ test('stream yields rows chunk by chunk, exposes columns, and ends cleanly', asy
     assert.deepEqual(partial, [{ id: 1 }]);
     assert.equal(c.isUsable(), true);
     assert.deepEqual((await c.query('SELECT id FROM t')).rows, [{ id: 9 }]);
-    // A ResultSets reply on the stream opcode is one whole frame: refuse the CALL, keep the connection.
-    await assert.rejects((async () => { for await (const _ of c.stream('CALL emits()')) {} })(), /unexpected response tag 8/);
+    // A ResultSets reply on the stream opcode is one whole frame: its sets
+    // come back (see the CALL test below) and nothing is left to drain.
+    assert.deepEqual(await collect(c.stream('CALL emits()')), [{ a: 1 }]);
+    assert.equal(c.stream.command, 'CALL');
+    assert.deepEqual((await c.query('SELECT id FROM t')).rows, [{ id: 9 }]);
+    await c.end();
+  });
+});
+
+test('a streamed CALL whose body EMITs yields its final set and puts every set under stream.resultSets', async () => {
+  // One ResultSets frame, as query() receives it: [a: x, y] then [b: z].
+  const sets = F.resultSets([[['a'], [['x'], ['y']]], [['b'], [['z']]]]);
+  const script = {
+    'CALL report(?)': sets,      // with values: OP_QUERY_STREAM_PARAMS, $1 sent as ?
+    'CALL report()': sets,       // without: OP_QUERY_STREAM
+    'SELECT id FROM big': [F.header(['id']), F.chunk([[1]]), F.end()],
+    'SELECT 1': F.rows(['x'], [[1]]),
+  };
+  const joined = (rs) => rs.map((s) => s.rows.map((r) => Object.values(r).join('')).join('')).join('|');
+  await withServer({ handle: scripted(script) }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    for (const [sql, values] of [['CALL report($1)', [5]], ['CALL report()', undefined]]) {
+      // The rows query() returns: the call's final result, the last set ...
+      assert.deepEqual(await collect(c.stream(sql, values)), [{ b: 'z' }], sql);
+      assert.equal(c.stream.command, 'CALL');
+      assert.deepEqual(c.stream.columns, ['b']);
+      assert.equal(c.stream.affected, null);
+      // ... and every set, in emission order, as query() puts them under resultSets.
+      assert.equal(joined(c.stream.resultSets), 'xy|z', sql);
+      assert.deepEqual(c.stream.resultSets.map((s) => s.columns), [['a'], ['b']]);
+      assert.equal(c.isUsable(), true);
+    }
+    assert.deepEqual(srv.requests.filter((r) => r.op !== 8).map((r) => r.op), [9, 5]);
+    assert.deepEqual(srv.requests[srv.requests.length - 2].params, [5]);
+    // Array rows, and leaving early: one frame, so there is nothing to drain.
+    assert.deepEqual(await collect(c.stream('CALL report()', { rowMode: 'array' })), [['z']]);
+    assert.deepEqual(c.stream.resultSets[0].rows, [['x'], ['y']]);
+    for await (const _ of c.stream('CALL report()')) break;
+    // Nothing is in flight, so a statement the loop body awaits runs instead
+    // of queueing behind the stream (which would wait on the body forever).
+    const queued = () => new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('the statement queued behind a finished CALL')), 2000).unref();
+    });
+    for await (const row of c.stream('CALL report()')) {
+      assert.deepEqual(row, { b: 'z' });
+      assert.deepEqual((await Promise.race([c.query('SELECT 1'), queued()])).rows, [{ x: 1 }]);
+    }
+    // Nothing was left on the socket: the same connection reads its own replies.
+    assert.deepEqual((await c.query('SELECT 1')).rows, [{ x: 1 }]);
+    assert.deepEqual(await collect(c.stream('SELECT id FROM big')), [{ id: 1 }]);
+    assert.equal(c.stream.resultSets, null, 'a later stream starts clean');
+    assert.equal(srv.connections, 1);
     await c.end();
   });
 });

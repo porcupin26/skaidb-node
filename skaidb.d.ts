@@ -145,10 +145,20 @@ export interface StreamFunction {
   <Row = any>(sql: string, values?: Value[] | null, opts?: StreamOptions): AsyncGenerator<Row, void, undefined>;
   /** Column names once the header arrives; `null` for a statement without rows. */
   columns?: string[] | null;
-  /** `'SELECT'` for rows, `'MUTATION'` or `'DDL'` for a statement that yields none. */
-  command?: "SELECT" | "MUTATION" | "DDL" | null;
+  /**
+   * `'SELECT'` for rows, `'MUTATION'` or `'DDL'` for a statement that yields
+   * none, `'CALL'` for a `CALL` whose body `EMIT`s result sets.
+   */
+  command?: "SELECT" | "MUTATION" | "DDL" | "CALL" | null;
   /** A mutation's affected-row count; `null` otherwise. */
   affected?: number | bigint | null;
+  /**
+   * Every result set of a `CALL` whose body `EMIT`s, in emission order, as
+   * `QueryResult.resultSets` holds them: the server answers such a call in
+   * one frame even when streamed, and the stream yields the last set's rows.
+   * `null` for every other statement.
+   */
+  resultSets?: QueryResult[] | null;
 }
 
 /** One event from a `CREATE STREAM` log, as yielded by `subscribe()`. */
