@@ -26,7 +26,7 @@ npm install @skaidb/client
 
 The package is `@skaidb/client` on the npm registry and is required as
 `@skaidb/client`. To install straight from GitHub instead, pin a tag with
-`npm install github:porcupin26/skaidb-node#v1.4.0` (`#main` follows the
+`npm install github:porcupin26/skaidb-node#v1.4.1` (`#main` follows the
 development branch); the module name is the same whatever the install
 source.
 
@@ -379,7 +379,7 @@ const pool = new Pool({
 | `idleOrder` | `'lifo'` | `'fifo'` hands out the longest-idle connection first, so every idle connection keeps being used and a server-side idle timeout never finds one. |
 | `discover` | `false` | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) when a member is first reached and every `refreshInterval` (60000 ms) after — every 5 s while one is `resyncing` or `unreachable`. New members are added, members that left are dropped (seeds are kept, marked `unlisted`), and members reported `resyncing` or `unreachable` get no new connections until they are `ready` again, when they start with a fresh latency average. An older or standalone server leaves the seeds as they are and is not asked again. |
 | `ejectErrors` | `3` | Consecutive transport failures (a failed dial, an I/O error mid-request, a capacity refusal) that eject a member. Statement errors and refused logins do not count. |
-| `ejectLatencyFactor`, `ejectLatencyFloor` | `3`, `50` (ms) | A member whose round-trip average is above factor × the other members' median **and** more than floor ms above it is ejected (after 10 samples on it and on another member). Factor `0` disables. |
+| `ejectLatencyFactor`, `ejectLatencyFloor` | `3`, `50` (ms) | A member whose round-trip average is above factor × the other members' median **and** more than floor ms above it is ejected (after 10 samples on it and on another member). The fastest of a member's first three round trips seeds its average, so a statement that stalls in your own process — a CPU-bound start-up blocking the event loop — cannot get a healthy member ejected; the `'eject'` event's `reason` names the average, the median and the slowest of the member's last 10 round trips. Factor `0` disables. |
 | `ejectBackoff`, `ejectBackoffMax` | `5000`, `60000` (ms) | How long an ejection lasts, doubling per repeat (back to the base after a healthy `ejectBackoffMax`). When it is up, a background probe dials the member and runs one statement; success re-admits it. The last usable member is never ejected. |
 | `readYourWrites` | `0` (off) | Milliseconds after a write during which checkouts with the same `affinity` go to the member that took it. |
 

@@ -335,7 +335,10 @@ export interface PoolMember {
 /** Payload of the pool's `'eject'` event. */
 export interface EjectEvent {
   endpoint: string;
-  /** Why: consecutive failures, or its latency against the median. */
+  /**
+   * Why: consecutive failures, or its latency average against the median
+   * and the slowest of its last 10 round trips.
+   */
   reason: string;
 }
 

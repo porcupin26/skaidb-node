@@ -261,9 +261,14 @@ The rules are shared by every skaidb driver
 ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)):
 
 - **Latency.** Per member, an exponentially weighted average of request
-  round trips (send to the first response frame): each sample moves it 5 %
-  of the way, no sample counts for more than 10 × the larger of the average
-  and `ejectLatencyFloor`, and the first sample sets it.
+  round trips (send to the first response frame). The fastest of the
+  member's first three round trips seeds it: a round trip is only ever
+  lengthened — by the member, the network or the client itself (an event
+  loop blocked while the application starts, say) — so one or two slow
+  first statements cannot set it. From then on each sample moves it 5 % of
+  the way, and no sample counts for more than 10 × the larger of the
+  average and `ejectLatencyFloor`. Until its average is seeded a member
+  counts as not measured (`latencyMs` is `null`).
 - **Ejection.** A member is ejected — no new connections, its idle ones
   closed — after `ejectErrors` consecutive transport failures (a failed
   dial, an I/O error mid-request, a capacity refusal; not a statement error
@@ -271,7 +276,11 @@ The rules are shared by every skaidb driver
   samples on it and on another usable member, its average is above
   `ejectLatencyFactor` × the median of the other usable members' averages
   (the lower middle when even) and more than `ejectLatencyFloor` above it.
-  The last usable member is never ejected.
+  The last usable member is never ejected. A latency ejection's `reason`
+  gives the member's average, the median it was compared with and the
+  slowest of its last 10 round trips (`latency 516.3 ms vs median 0.2 ms;
+  slowest of the last 10 round trips 900.0 ms`), which tells a slow member
+  from one slow statement.
 - **Re-admission.** When the backoff is up, a background timer
   (`unref()`'d, so it never keeps the process alive) dials the member alone
   and runs `SHOW DATABASES`: success re-admits it with a fresh average and

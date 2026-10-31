@@ -1247,12 +1247,18 @@ function memberFault(e) {
   return !msg.startsWith('server signature mismatch');
 }
 
-// Latency EWMA: each round trip moves a member's average 5% toward it, and no
-// sample counts for more than 10x the larger of the current average and the
-// ejection floor — one slow query does not eject a healthy member, a member
-// that stays slow is ejected within a few dozen statements.
+// Latency EWMA: the fastest of a member's first round trips seeds it (a round
+// trip is only ever lengthened — by the member, the network or this process
+// stalling — so a slow first statement cannot set it); then each round trip
+// moves it 5% toward it, and no sample counts for more than 10x the larger of
+// the current average and the ejection floor — one slow query does not eject
+// a healthy member, a member that stays slow is ejected within a few dozen
+// statements.
+const EWMA_SEED_SAMPLES = 3;
 const EWMA_WEIGHT = 0.05;
 const EWMA_CLAMP = 10;
+// Round trips a latency ejection's reason reports the slowest of.
+const RECENT_SAMPLES = 10;
 // Round trips a member (and at least one other) needs before its average
 // can eject it.
 const EWMA_MIN_SAMPLES = 10;
@@ -1283,6 +1289,8 @@ class Member {
     this.canonical = null;            // its own SHOW ENDPOINTS name
     this.listed = 'ready';            // ready | resyncing | unreachable | unlisted
     this.ewma = null;                 // round-trip average, milliseconds
+    this.firsts = [];                 // round trips before the average is seeded
+    this.recent = [];                 // the last RECENT_SAMPLES round trips
     this.samples = 0;
     this.lastSample = -Infinity;
     this.errors = 0;                  // consecutive transport failures
@@ -1291,6 +1299,14 @@ class Member {
     this.readmittedAt = -Infinity;
     this.inUse = 0;
     this.probing = false;
+  }
+
+  /** Measure the member afresh (a re-admission, back to ready). */
+  resetLatency() {
+    this.ewma = null;
+    this.firsts = [];
+    this.recent = [];
+    this.samples = 0;
   }
 }
 
@@ -1606,8 +1622,14 @@ class Pool extends EventEmitter {
     const m = this._members.get(key);
     if (!m) return;
     m.errors = 0;
+    m.recent.push(ms);
+    if (m.recent.length > RECENT_SAMPLES) m.recent.shift();
     if (m.ewma === null) {
-      m.ewma = ms;
+      m.firsts.push(ms);
+      if (m.firsts.length >= EWMA_SEED_SAMPLES) {
+        m.ewma = Math.min(...m.firsts);
+        m.firsts = [];
+      }
     } else {
       const cap = EWMA_CLAMP * Math.max(m.ewma, this._ejectFloor);
       m.ewma += EWMA_WEIGHT * (Math.min(ms, cap) - m.ewma);
@@ -1617,7 +1639,7 @@ class Pool extends EventEmitter {
     // Only a member still in rotation can be ejected for latency: round trips
     // finishing on connections checked out before an ejection must not eject
     // it again (and double its backoff).
-    if (this._usable(m) && m.samples >= EWMA_MIN_SAMPLES && this._ejectFactor > 0) {
+    if (this._usable(m) && m.ewma !== null && m.samples >= EWMA_MIN_SAMPLES && this._ejectFactor > 0) {
       const others = [];
       for (const o of this._members.values()) {
         if (o !== m && this._usable(o) && o.ewma !== null && o.samples >= EWMA_MIN_SAMPLES) {
@@ -1628,7 +1650,8 @@ class Pool extends EventEmitter {
         others.sort((x, y) => x - y);
         const median = others[(others.length - 1) >> 1];   // the lower middle when even
         if (m.ewma > this._ejectFactor * median && m.ewma - median > this._ejectFloor) {
-          this._eject(m, `latency ${m.ewma.toFixed(1)} ms vs median ${median.toFixed(1)} ms`);
+          this._eject(m, `latency ${m.ewma.toFixed(1)} ms vs median ${median.toFixed(1)} ms; `
+            + `slowest of the last ${m.recent.length} round trips ${Math.max(...m.recent).toFixed(1)} ms`);
         }
       }
     }
@@ -1734,8 +1757,7 @@ class Pool extends EventEmitter {
     if (ok) {
       m.ejectedUntil = null;
       m.errors = 0;
-      m.ewma = null;
-      m.samples = 0;
+      m.resetLatency();
       m.readmittedAt = performance.now();
       process.nextTick(() => this.emit('readmit', { endpoint: m.key }));
       if (this._members.get(m.key) === m && this._idle.length < this.maxsize) {
@@ -1855,8 +1877,7 @@ class Pool extends EventEmitter {
       const state = LISTED_STATES.includes(reported) ? reported : 'ready';
       if (state === 'ready' && m.listed !== 'ready') {
         // Back in rotation: measured afresh, like a re-admission.
-        m.ewma = null;
-        m.samples = 0;
+        m.resetLatency();
         m.errors = 0;
       }
       m.listed = state;

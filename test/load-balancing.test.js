@@ -155,7 +155,10 @@ test('pool: members() reports state, latency and connections', () => withMembers
   let [row] = p.members();
   assert.equal(row.inUse, 1);
   assert.equal(row.idle, 0);
-  assert.equal(typeof row.latencyMs, 'number');
+  assert.equal(row.latencyMs, null, 'not measured until its first three round trips');
+  await conn.query('SELECT member()');
+  await conn.query('SELECT member()');
+  assert.equal(typeof p.members()[0].latencyMs, 'number');
   await p.release(conn);
   [row] = p.members();
   assert.equal(row.inUse, 0);
@@ -245,6 +248,57 @@ test('pool: one slow statement does not eject a member', () => withMembers('abc'
   assert.equal(stateOf(p, b), 'ready');
 }));
 
+// Stand-ins for connections to each member, by name, to feed the pool's
+// latency measurements round trips of a chosen length.
+const fakes = (ms) => Object.fromEntries(
+  ms.map((m) => [m.name, { _connected: m.endpoint, _poolEp: m.endpoint, _poolOut: false }]));
+
+test('pool: a slow first round trip does not eject a member', () => withMembers('abc', async ([a, b, c], pool) => {
+  // The first statements on b stall in the client — a CPU-bound application
+  // starting up blocks the event loop — and b answers fast from then on: the
+  // fastest of its first round trips seeds its average, so b stays in
+  // rotation. (Seeded by its first round trip alone, b's average still read
+  // ~3.8 s once another member had 10 samples, and b was ejected.)
+  const p = pool([a, b, c], { loadBalancing: 'round_robin', ejectLatencyFloor: 50 });
+  const fake = fakes([a, b, c]);
+  p._roundTrip(fake.b, 6600);
+  p._roundTrip(fake.b, 3000);
+  for (let i = 0; i < 12; i++) for (const name of 'abc') p._roundTrip(fake[name], 0.2);
+  assert.equal(stateOf(p, b), 'ready');
+  assert.ok(p._members.get(b.endpoint).ewma < 50);
+}));
+
+test('pool: a member slow from its first round trip is ejected and the reason names its slowest round trip', () => withMembers('abc', async ([a, b, c], pool) => {
+  const p = pool([a, b, c], { loadBalancing: 'round_robin', ejectLatencyFloor: 50, ejectBackoff: 30000 });
+  const reasons = [];
+  p.on('eject', (e) => reasons.push(e.reason));
+  const fake = fakes([a, b, c]);
+  for (let i = 0; i < 12; i++) {
+    p._roundTrip(fake.a, 0.2);
+    p._roundTrip(fake.c, 0.2);
+    p._roundTrip(fake.b, i === 5 ? 900 : 500);
+  }
+  assert.equal(stateOf(p, b), 'ejected');
+  await sleep(0);                                     // listeners run on a later tick
+  assert.equal(reasons.length, 1, reasons.join(' | '));
+  assert.match(reasons[0], /^latency 5\d\d\.\d ms vs median 0\.2 ms; slowest of the last 10 round trips 900\.0 ms$/);
+}));
+
+test('pool: a re-admitted member is seeded afresh', () => withMembers('abc', async ([a, b, c], pool) => {
+  const p = pool([a, b, c], { loadBalancing: 'round_robin', ejectErrors: 1 });
+  const m = p._members.get(b.endpoint);
+  const fake = fakes([a, b, c]);
+  for (const t of [4, 3, 2]) p._roundTrip(fake.b, t);
+  assert.equal(m.ewma, 2);
+  p._failed(b.endpoint);
+  assert.equal(stateOf(p, b), 'ejected');
+  await p._probe(m);                                  // b answers: re-admitted
+  assert.equal(stateOf(p, b), 'ready');
+  assert.deepEqual([m.ewma, m.firsts, m.recent, m.samples], [null, [], [], 0]);
+  p._roundTrip(fake.b, 7);
+  assert.equal(m.ewma, null, 'not measured until its first three round trips');
+}));
+
 test('pool: the last usable member is never ejected', () => withMembers('abc', async ([a, b, c], pool) => {
   b.srv.refuse = true;
   c.srv.refuse = true;
@@ -309,10 +363,12 @@ test('pool: members are discovered and resyncing ones get no connections', () =>
   // c catches up: the next refresh lets it in, measured afresh.
   const m = p._members.get(c.endpoint);
   m.ewma = 9.9;
+  m.firsts = [9.9];
+  m.recent = [9.9];
   m.samples = 50;
   states[c.endpoint] = 'ready';
   await relist(p);
-  assert.deepEqual([m.ewma, m.samples], [null, 0]);
+  assert.deepEqual([m.ewma, m.firsts, m.recent, m.samples], [null, [], [], 0]);
   assert.ok((await serve(p, 6)).includes('c'));
 }));
 
