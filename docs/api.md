@@ -1,7 +1,7 @@
 # API reference
 
 ```js
-const { Client, Pool, SkaidbError, CONSISTENCY } = require('@skaidb/client');
+const { Client, Pool, SkaidbError, TransactionConflictError, CONSISTENCY } = require('@skaidb/client');
 ```
 
 Everything is exported from the package root. Types for TypeScript are in
@@ -69,7 +69,9 @@ Behaviour:
 - A broken connection is re-dialled before the statement is sent
   ([reconnect](#reconnect)).
 - A statement error rejects with `SkaidbError(<server message>)` and leaves
-  the connection usable.
+  the connection usable. A message that starts with `transaction conflict:`
+  rejects with its subclass
+  [`TransactionConflictError`](#transactionconflicterror).
 
 #### Parameters
 
@@ -113,6 +115,53 @@ result is the total affected count.
 - `opts = { consistency? }`; the default is the client's consistency.
 - The whole request must fit one 64 MiB frame; split very large batches.
 - `rows = []` resolves to `0` without a round-trip.
+
+### `client.transaction(body, opts?): Promise<T>`
+
+`opts = { attempts?: number, begin?: string }` (defaults `3`, `'BEGIN'`).
+Runs `body` in a transaction on this connection and resolves to what `body`
+returns. `body` is called with the client itself and may be async; `begin`
+is the opening statement, sent verbatim — `'BEGIN'` on a standalone server,
+`'BEGIN ATOMIC'` or `'BEGIN ATOMIC PARTITION (col = literal)'` on a cluster.
+
+1. `attempts` below 1 (or a `body` that is not a function, or a `begin`
+   that is not a string) rejects with a `SkaidbError` before anything is
+   sent.
+2. `begin` is sent. If it fails, that error is thrown: `body` never runs
+   and nothing else is sent — without an open transaction every statement
+   would autocommit on its own.
+3. `body(client)` is awaited.
+4. If `body` throws: `ROLLBACK` is sent, any error from the `ROLLBACK`
+   itself is dropped, and `body`'s error is thrown unchanged. It is never
+   run again for that, even when the error is a
+   `TransactionConflictError`.
+5. Otherwise `COMMIT` is sent.
+   - It succeeds: the call resolves to `body`'s value.
+   - It is refused with a `TransactionConflictError` and fewer than
+     `attempts` runs were made: back to step 2 — `body` runs again from the
+     start, so it must be safe to run more than once and should do nothing
+     outside the database that a retry would repeat.
+   - It is refused with a `TransactionConflictError` on the last run: that
+     error is thrown.
+   - It fails any other way: that error is thrown. No retry and no
+     `ROLLBACK`; a failed `COMMIT` has ended the transaction.
+6. There is no sleep or backoff between runs: a refused `COMMIT` means the
+   other writer has already finished, and the next run reads the rows as
+   they are now.
+
+While the transaction is open the client does not [reconnect](#reconnect):
+a statement that finds the connection gone — one of `body`'s, or the
+`COMMIT` — rejects with `connection lost during a transaction` and is not
+sent, and neither is a `ROLLBACK`. A statement in flight when the
+connection dies rejects with the usual `connection lost` / `connection
+closed`. Neither is retried. If the connection dies while the `COMMIT` is in
+flight, the client cannot know whether it was applied.
+
+The transaction is the connection's: every statement sent on this client
+until it ends is part of it, whoever sends it. A second `transaction()` on a
+client that has one running — from inside `body` too — rejects with `a
+transaction is already running on this connection` before anything is sent.
+Use a `Pool` (`pool.transaction()`) for transactions that run concurrently.
 
 ### `client.stream(sql, values?, opts?)` → `AsyncGenerator<Row>`
 
@@ -215,7 +264,9 @@ Closes the connection. Terminal: any later statement rejects with
 A transport failure (socket error or close) rejects the in-flight statement
 with `connection lost` or `connection closed` and marks the client broken.
 The next `query()`, `batch()` or `stream()` first re-dials — the full seed
-walk, handshake, Hello and `USE` — then runs. The prepared-statement cache
+walk, handshake, Hello and `USE` — then runs (except while a
+[`transaction()`](#clienttransactionbody-opts-promiset) is open, which
+fails instead). The prepared-statement cache
 is cleared. The driver never re-runs the failed statement: it may have
 executed on the server, and retrying a write could duplicate it. A protocol
 desync (an unexpected frame) is handled the same way: the connection is
@@ -245,8 +296,9 @@ An unknown `loadBalancing` or `idleOrder`, `maxsize < 1` or
 | Member | Meaning |
 |---|---|
 | `pool.acquire(options?): Promise<Client>` | An idle connection to the member the policy picks, validated with `isUsable()` (a dead one is discarded and the next tried), or one freshly dialed to it — a failed dial falls through to the other usable members, then to the unusable ones. `options.affinity` (any value; a user or session id) scopes `readYourWrites`; without it checkouts share one pool-wide key. Rejects with `pool is closed` after `end()`, and with `no reachable endpoint in …` when no member can be dialed. |
-| `pool.release(conn): Promise<void>` | Returns a connection; closes it instead when it is broken, its member is ejected, not `ready` or gone, the pool is closed, or `maxsize` idle connections already exist. |
+| `pool.release(conn): Promise<void>` | Returns a connection; closes it instead when it is broken, its member is ejected, not `ready` or gone, the pool is closed, `maxsize` idle connections already exist, or a `transaction()` may still be open on it (one still running, or one whose `ROLLBACK` failed). |
 | `pool.withConnection(fn)` · `pool.withConnection(options, fn)`: `Promise<T>` | `acquire(options)`, run `fn(conn)`, `release()` however `fn` ends. |
+| `pool.transaction(body, opts?): Promise<T>` | [`client.transaction(body, opts)`](#clienttransactionbody-opts-promiset) on one checked-out connection: checked out once, held for every statement and every run, released however it ends. `body` gets that connection. `opts = { attempts?, begin?, affinity? }`, `affinity` as in `acquire()`. Bad arguments reject before a connection is checked out. |
 | `pool.members(): PoolMember[]` | One entry per member, in endpoint order: `endpoint` (what the pool dials), `canonical` (the member's own name once discovered, else `null`), `state` (`'ready'`, `'ejected'`, `'resyncing'`, `'unreachable'`, `'unlisted'`), `latencyMs` (round-trip average, `null` until measured), `inUse`, `idle`, `seed`. |
 | `pool.end(): Promise<void>` | Closes every idle connection and stops the probe/discovery timer; checked-out ones close on release. |
 | `pool.maxsize`, `pool.closed` | The configured bound; whether `end()` was called. |
@@ -303,7 +355,7 @@ The rules are shared by every skaidb driver
   ejected or not `ready`.
 
 A connection checked out with `acquire()` is an ordinary `Client`: the same
-serialization, streaming and reconnect rules apply — except that a pooled
+serialization, streaming, transaction and reconnect rules apply — except that a pooled
 connection re-dials in the pool's order (usable members first, the one it
 just lost last) instead of walking the shuffled seeds.
 
@@ -313,6 +365,22 @@ just lost last) instead of walking the shuffled seeds.
 errors carrying the server's message, protocol and codec errors, connection
 and authentication errors, binding errors — is an instance. Node's own
 socket errors are wrapped (`connect failed: <message>`).
+
+## `TransactionConflictError`
+
+`class TransactionConflictError extends SkaidbError`. A statement error
+whose message starts with `transaction conflict:`, which is how the server
+refuses a `COMMIT` when another writer changed a row the transaction writes
+after its `BEGIN` (a standalone server ≥ 0.346.0). Only that prefix is
+matched; `message` is the server's message, unchanged. Nothing was applied,
+the transaction is over, and the connection is back in autocommit and stays
+usable, so running the whole transaction again from `BEGIN` is safe —
+[`transaction()`](#clienttransactionbody-opts-promiset) does.
+
+It is raised wherever a statement error is: `query()` with or without
+values, `batch()` and `stream()`. Code that catches `SkaidbError` keeps
+catching it. Like every statement error it leaves the connection open, does
+not trigger a reconnect and does not count against a pool member's health.
 
 ## `CONSISTENCY`
 

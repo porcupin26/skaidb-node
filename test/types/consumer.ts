@@ -4,10 +4,10 @@
 // goes stale, this file stops compiling.
 
 import {
-  Client, Pool, SkaidbError, CONSISTENCY,
+  Client, Pool, SkaidbError, TransactionConflictError, CONSISTENCY,
   ClientOptions, PoolOptions, QueryResult, QueryConfig, StreamEvent, StreamOptions, Value, Consistency,
   AuthMechanism, BatchOptions, LoadBalancing, IdleOrder, MemberState, PoolMember, AcquireOptions,
-  EjectEvent, ReadmitEvent,
+  EjectEvent, ReadmitEvent, TransactionOptions, PoolTransactionOptions,
 } from '@skaidb/client';
 
 interface User { id: number; name: string; tags: string[] }
@@ -49,6 +49,24 @@ async function main(): Promise<void> {
   const batchOpts: BatchOptions = { consistency: 'ALL' };
   const affectedAll: number = await client.batch('DELETE FROM users WHERE id = $1', [[1]], batchOpts);
   void affectedAll;
+
+  // transaction(): the body gets the client and may be async or not; the
+  // call resolves to the body's value.
+  const txOpts: TransactionOptions = { attempts: 5, begin: 'BEGIN ATOMIC PARTITION (tenant = 7)' };
+  const left: number = await client.transaction(async (tx: Client) => {
+    const res = await tx.query<{ qty: number }>('SELECT qty FROM stock WHERE id = $1', [7]);
+    await tx.query('UPDATE stock SET qty = $2 WHERE id = $1', [7, res.rows[0].qty - 1]);
+    return res.rows[0].qty - 1;
+  }, txOpts);
+  const label: string = await client.transaction(() => 'no statements');
+  const nothing: void = await client.transaction(async (tx) => { await tx.query('DELETE FROM stock WHERE qty = 0'); });
+  // @ts-expect-error attempts is a number
+  void client.transaction(async () => 1, { attempts: 'three' });
+  // @ts-expect-error the body is a function, not a statement
+  void client.transaction('BEGIN');
+  // @ts-expect-error affinity is a checkout option: the pool's transaction() takes it, a client's does not
+  const noAffinity: TransactionOptions = { affinity: 'user-42' };
+  void [left, label, nothing, noAffinity];
 
   // stream(): async iteration, options, columns slot.
   for await (const row of client.stream<User>('SELECT id, name, tags FROM users', { consistency: 'ONE' })) {
@@ -140,6 +158,14 @@ async function main(): Promise<void> {
   });
   const conn: Client = await pool.acquire();
   await pool.release(conn);
+  // transaction() on the pool: one checked-out connection, plus the checkout's affinity.
+  const poolTx: PoolTransactionOptions = { attempts: 2, begin: 'BEGIN', affinity: 'user-42' };
+  const moved: number = await pool.transaction(async (c: Client) => {
+    await c.query('UPDATE accounts SET balance = balance - $2 WHERE id = $1', [1, 10]);
+    return 10;
+  }, poolTx);
+  const viaPoolTx: boolean = await pool.transaction(() => true);
+  void [moved, viaPoolTx];
   const closed: boolean = pool.closed;
   const max: number = pool.maxsize;
   await pool.end();
@@ -179,6 +205,19 @@ async function main(): Promise<void> {
   } catch (e) {
     if (e instanceof SkaidbError) { const msg: string = e.message; void msg; }
   }
+  // A refused COMMIT is a TransactionConflictError, which is a SkaidbError.
+  try {
+    await client.query('COMMIT');
+  } catch (e) {
+    if (e instanceof TransactionConflictError) {
+      const asBase: SkaidbError = e;
+      const asError: Error = e;
+      const msg: string = e.message;
+      void [asBase, asError, msg];
+    }
+  }
+  const conflict: SkaidbError = new TransactionConflictError('transaction conflict: …');
+  void conflict;
 
   // Consistency accepts numbers and names.
   const levels: Consistency[] = [0, 1, 2, 'ONE', 'QUORUM', 'ALL', CONSISTENCY.ALL];

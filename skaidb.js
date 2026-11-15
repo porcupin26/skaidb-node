@@ -26,14 +26,39 @@ const DRAIN_BUDGET_BYTES = 8 * 1024 * 1024;
 
 class SkaidbError extends Error {}
 
+/**
+ * The server refused a COMMIT because another writer changed a row the
+ * transaction writes after its BEGIN. Nothing was applied, the transaction
+ * is over and the connection is back in autocommit, still usable: running
+ * the whole transaction again from BEGIN is safe, which is what
+ * transaction() does. `message` is the server's message, unchanged.
+ */
+class TransactionConflictError extends SkaidbError {}
+
+// PROTOCOL.md §6 rule 6: a conflict is recognised by this prefix and nothing
+// else; the rest of the message may change.
+const CONFLICT_PREFIX = 'transaction conflict:';
+
 // Errors the server answered with (an Error frame): the statement failed and
 // the member that sent it is fine. A pool tells them apart from transport
 // failures, which count against a member's health.
 const statementErrors = new WeakSet();
 function statementError(msg) {
-  const e = new SkaidbError(msg);
+  const e = msg.startsWith(CONFLICT_PREFIX) ? new TransactionConflictError(msg) : new SkaidbError(msg);
   statementErrors.add(e);
   return e;
+}
+
+/**
+ * transaction()'s arguments, checked before anything is sent (and, on a
+ * pool, before a connection is checked out).
+ */
+function transactionArgs(body, opts) {
+  if (typeof body !== 'function') throw new SkaidbError('transaction() takes the function to run');
+  const { attempts = 3, begin = 'BEGIN' } = opts === undefined || opts === null ? {} : opts;
+  if (!(attempts >= 1)) throw new SkaidbError('attempts must be >= 1');
+  if (typeof begin !== 'string') throw new SkaidbError('begin must be the opening statement, a string');
+  return { attempts, begin };
 }
 
 // ---- Value codec (§4 of PROTOCOL.md) --------------------------------------
@@ -400,6 +425,10 @@ class Client {
     this._broken = false;      // transport died: recoverable on next statement
     this._reconnecting = false;
     this._prepared = new Map();
+    // transaction() in progress: 'begin' until its opening statement is
+    // answered, 'open' from then until the transaction ends, else null.
+    this._txn = null;
+    this._txnRollbackFailed = false;   // the last transaction()'s clean-up ROLLBACK did not go through
     this._connected = null;    // 'host:port' reached by the last successful dial
     // The pool that owns this client (see Pool): told each round trip's
     // latency, each transport failure and each write, and asked for the dial
@@ -606,12 +635,18 @@ class Client {
   async _ensureLive() {
     if (this._closed) throw new SkaidbError('connection is closed');
     if (!this._broken || this._reconnecting) return;
+    // A transaction lives on the connection its BEGIN went out on and died
+    // with it. Re-dialling here would send the rest of it — and its COMMIT —
+    // to a connection with no transaction open, where each statement
+    // autocommits on its own: fail instead, sending nothing.
+    if (this._txn === 'open') throw new SkaidbError('connection lost during a transaction');
     this._reconnecting = true;
     try {
       // Pooled: the pool's current order (usable members first, the one
       // just lost last) instead of the seeds.
       const order = this._pool !== null ? this._pool._dialOrder(this._connected) : null;
       this._prepared.clear();
+      this._txnRollbackFailed = false;   // whatever was open went with the old socket
       this._waiters = [];
       this._frames = [];
       this._buf = Buffer.alloc(0);
@@ -992,6 +1027,74 @@ class Client {
     });
     this._queryChain = run.catch(() => {});
     return run;
+  }
+
+  /**
+   * Run `body` in a transaction on this connection and resolve to what it
+   * returns: `begin` is sent, then `body(client)` is awaited — it gets this
+   * client, so its statements go out on the same connection — then COMMIT.
+   *
+   *   const left = await client.transaction(async (tx) => {
+   *     const { rows } = await tx.query('SELECT qty FROM stock WHERE id = $1', [7]);
+   *     await tx.query('UPDATE stock SET qty = $2 WHERE id = $1', [7, rows[0].qty - 1]);
+   *     return rows[0].qty - 1;
+   *   });
+   *
+   * `opts` is { attempts = 3, begin = 'BEGIN' }. `begin` is the opening
+   * statement, sent verbatim: plain BEGIN on a standalone server, BEGIN
+   * ATOMIC or BEGIN ATOMIC PARTITION (col = literal) on a cluster.
+   *
+   * - `begin` fails: its error is thrown; the body never runs and nothing
+   *   else is sent (without an open transaction each statement would
+   *   autocommit on its own).
+   * - The body throws: ROLLBACK is sent and the body's error is thrown
+   *   unchanged, whatever the ROLLBACK itself answers. Never run again, even
+   *   when that error is a conflict.
+   * - COMMIT is refused with a TransactionConflictError: the whole
+   *   transaction runs again from `begin`, at once (the other writer has
+   *   already finished), until it has run `attempts` times in all; the last
+   *   conflict is thrown. So the body must be safe to run more than once and
+   *   should do nothing outside the database that a retry would repeat.
+   * - COMMIT fails any other way: that error is thrown. No retry and no
+   *   ROLLBACK — a failed COMMIT has ended the transaction.
+   *
+   * A connection lost while the transaction is open is not re-dialled: the
+   * statement that finds it gone, the COMMIT included, fails with
+   * `connection lost during a transaction` and nothing more is sent. Nothing
+   * else may use this client meanwhile — its statements would join the
+   * transaction — and a second transaction() on it is refused until the
+   * first has ended. `attempts` below 1 is refused before anything is sent.
+   */
+  async transaction(body, opts) {
+    const { attempts, begin } = transactionArgs(body, opts);
+    if (this._txn !== null) throw new SkaidbError('a transaction is already running on this connection');
+    this._txnRollbackFailed = false;
+    for (let attempt = 1; ; attempt++) {
+      this._txn = 'begin';
+      try {
+        await this.query(begin);
+        this._txn = 'open';
+        let value;
+        try {
+          value = await body(this);
+        } catch (e) {
+          // The clean-up never replaces the error it cleans up after: a
+          // ROLLBACK with nothing open is itself an Error on servers before
+          // 0.347, and on a lost connection it is not sent at all.
+          try { await this.query('ROLLBACK'); } catch (_) { this._txnRollbackFailed = true; }
+          throw e;
+        }
+        try {
+          await this.query('COMMIT');
+        } catch (e) {
+          if (e instanceof TransactionConflictError && attempt < attempts) continue;
+          throw e;
+        }
+        return value;
+      } finally {
+        this._txn = null;
+      }
+    }
   }
 
   /**
@@ -1457,7 +1560,8 @@ class Pool extends EventEmitter {
 
   /**
    * Return a connection, closing it if it is broken, its member is ejected,
-   * not ready or gone, or the pool is full.
+   * not ready or gone, the pool is full, or a transaction() may still be
+   * open on it.
    */
   async release(conn) {
     const m = this._members.get(conn._poolEp);
@@ -1465,7 +1569,11 @@ class Pool extends EventEmitter {
       conn._poolOut = false;
       if (m && m.inUse > 0) m.inUse--;
     }
-    if (!this.closed && conn.isUsable() && m && this._usable(m) && this._idle.length < this.maxsize) {
+    // Released while its transaction() is still running, or after one whose
+    // clean-up ROLLBACK did not go through: the transaction may still be
+    // open on the connection, and the next caller must not inherit it.
+    const settled = conn._txn === null && !conn._txnRollbackFailed;
+    if (!this.closed && settled && conn.isUsable() && m && this._usable(m) && this._idle.length < this.maxsize) {
       this._idle.push(conn);
       return;
     }
@@ -1481,6 +1589,25 @@ class Pool extends EventEmitter {
     const conn = await this.acquire(options);
     try {
       return await fn(conn);
+    } finally {
+      await this.release(conn);
+    }
+  }
+
+  /**
+   * Run `body` in a transaction on ONE checked-out connection, held for the
+   * whole transaction and returned afterwards: Client's transaction() with
+   * the same rules, `body` getting that connection. `opts` is
+   * { attempts = 3, begin = 'BEGIN', affinity? }, `affinity` as in
+   * acquire(). Bad arguments are refused before a connection is checked out.
+   *
+   *   await pool.transaction(async (tx) => { await tx.query('UPDATE ...'); });
+   */
+  async transaction(body, opts) {
+    transactionArgs(body, opts);
+    const conn = await this.acquire(opts);
+    try {
+      return await conn.transaction(body, opts);
     } finally {
       await this.release(conn);
     }
@@ -1891,7 +2018,7 @@ class Pool extends EventEmitter {
   }
 }
 
-module.exports = { Client, Pool, SkaidbError, CONSISTENCY };
+module.exports = { Client, Pool, SkaidbError, TransactionConflictError, CONSISTENCY };
 
 // The pure pieces (value codec, parameter binding, framing helpers), exposed
 // for the driver's own unit tests. Not part of the supported API: anything

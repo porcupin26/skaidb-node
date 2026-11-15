@@ -11,6 +11,8 @@ modeled on [node-postgres (`pg`)](https://node-postgres.com/): `new Client(…)`
   batches, full type fidelity (bigint, Decimal, UUID, Bytes, Timestamp, Array, Document).
 - Multi-seed failover, transparent reconnect, TLS, connection pooling balanced
   across the cluster's members (policies, health ejection, discovery).
+- Transactions: a `transaction()` helper that runs again when the server
+  refuses the `COMMIT` for a conflict, and a typed error for that refusal.
 
 Full documentation: this README, the [`docs/`](docs/) folder
 ([getting started](docs/getting-started.md) · [API reference](docs/api.md) ·
@@ -26,7 +28,7 @@ npm install @skaidb/client
 
 The package is `@skaidb/client` on the npm registry and is required as
 `@skaidb/client`. To install straight from GitHub instead, pin a tag with
-`npm install github:porcupin26/skaidb-node#v1.4.1` (`#main` follows the
+`npm install github:porcupin26/skaidb-node#v1.5.0` (`#main` follows the
 development branch); the module name is the same whatever the install
 source.
 
@@ -223,10 +225,91 @@ r.rows         // the LAST set (the call's own result)
 
 ### Transactions
 
-Every statement autocommits; the driver adds no transaction API of its own.
-Whatever transaction statements your server version supports are plain SQL
-sent through `query()` on one connection (statements on a client are
-serialized, so they run in order). `batch()` rows autocommit one by one, as
+A transaction is plain SQL on **one connection**: `BEGIN`, the statements,
+then `COMMIT` or `ROLLBACK`. A standalone server opens one with `BEGIN`, a
+cluster with `BEGIN ATOMIC` or `BEGIN ATOMIC PARTITION (col = literal)`;
+outside one, every statement autocommits. `client.transaction(body, opts?)`
+runs the whole sequence:
+
+```js
+const left = await client.transaction(async (tx) => {
+  const { rows } = await tx.query('SELECT qty FROM stock WHERE id = $1', [7]);
+  await tx.query('UPDATE stock SET qty = $2 WHERE id = $1', [7, rows[0].qty - 1]);
+  return rows[0].qty - 1;
+});
+```
+
+It sends `BEGIN`, awaits `body` — handing it the client, so its statements
+go out on the same connection — then sends `COMMIT` and resolves to what
+`body` returned. If `body` throws, it sends `ROLLBACK` and throws that same
+error, whatever the `ROLLBACK` itself answers. If `BEGIN` fails, `body`
+never runs and nothing else is sent.
+
+**Conflicts.** A standalone server refuses a `COMMIT` when another writer
+changed a row the transaction writes after its `BEGIN`: nothing was
+applied, the transaction is over, and the connection is back in autocommit
+and stays usable. The driver raises that as a `TransactionConflictError` —
+a `SkaidbError` subclass carrying the server's message, raised by
+`query()`, `batch()` and `stream()` alike — and `transaction()` answers it
+by running everything again from `BEGIN`, at once, until it has run
+`attempts` times in all (default 3); the last conflict is thrown. So
+**`body` must be safe to run more than once** and should do nothing outside
+the database that a retry would repeat. Nothing else is retried: not an
+error `body` throws (a conflict included), not any other `COMMIT` error
+(the transaction is over, so no `ROLLBACK` is sent either), not a lost
+connection.
+
+`opts` is `{ attempts: 3, begin: 'BEGIN' }`; `begin` is the opening
+statement, sent verbatim:
+
+```js
+await client.transaction(body, { begin: 'BEGIN ATOMIC PARTITION (tenant = 7)', attempts: 5 });
+```
+
+On a pool, `pool.transaction(body, opts?)` checks out one connection, runs
+the whole transaction on it (`body` gets that connection) and returns it;
+`opts` also takes `affinity`.
+
+Written by hand, the same thing is:
+
+```js
+const { TransactionConflictError } = require('@skaidb/client');
+
+await client.query('BEGIN');                        // if this throws, stop here
+try {
+  await client.query('UPDATE accounts SET balance = balance - $2 WHERE id = $1', [1, 10]);
+  await client.query('UPDATE accounts SET balance = balance + $2 WHERE id = $1', [2, 10]);
+} catch (e) {
+  await client.query('ROLLBACK').catch(() => {});   // its own error must not replace e
+  throw e;
+}
+try {
+  await client.query('COMMIT');
+} catch (e) {
+  if (e instanceof TransactionConflictError) {
+    // nothing was applied: run the whole thing again from BEGIN
+  }
+  throw e;                                          // a failed COMMIT ended the transaction: no ROLLBACK
+}
+```
+
+Two rules, either way:
+
+- **One connection for the whole transaction.** On a pool that is one
+  checkout around all of it — `pool.transaction()`, or a single
+  `withConnection()` / `acquire()` — never a checkout per statement. And
+  nothing else may use that client meanwhile: its statements would join
+  the transaction. `transaction()` refuses a second call on a client that
+  has one running, and it never reconnects mid-transaction: when the
+  connection is lost, the statement that finds it gone (the `COMMIT`
+  included) fails with `connection lost during a transaction` and nothing
+  more is sent. Hand-written statements have no such guard — one sent
+  after the connection was lost re-dials and runs on its own, outside any
+  transaction.
+- **Stop if `BEGIN` fails.** With no transaction open, every statement
+  after it autocommits on its own.
+
+`batch()` is not a transaction: its rows autocommit one by one, as
 described above.
 
 ## Streaming large results — `client.stream(sql, values?, opts?)`
@@ -353,8 +436,10 @@ await pool.end();
 checked out: a burst opens extras and the surplus is closed on release.
 `acquire()` validates an idle connection before handing it out and discards
 one the server closed meanwhile; `release()` closes a broken connection
-instead of pooling it. Every `Client` option passes through; `seeds` (or
-`host`/`port`) name the starting members.
+instead of pooling it, and likewise one that a `transaction()` may still be
+open on. Every `Client` option passes through; `seeds` (or `host`/`port`)
+name the starting members. `pool.transaction()` runs a
+[transaction](#transactions) on one checked-out connection.
 
 ### Balancing across members
 
@@ -428,11 +513,16 @@ driver ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a
 Every error the driver raises is a `SkaidbError` (an `Error` subclass).
 
 - **Statement errors** (`SELECT nope` → `no such column …`) reject the call;
-  the connection stays usable.
+  the connection stays usable. One whose message starts with `transaction
+  conflict:` — a `COMMIT` the server refused — is a
+  `TransactionConflictError`, a `SkaidbError` subclass
+  ([Transactions](#transactions)); like any statement error it neither
+  drops the connection nor counts against a pool member's health.
 - **Transport errors** reject the in-flight statement with `connection lost`
   / `connection closed` and mark the client *broken*, not closed. The next
   statement **re-dials** (through the seed walk), re-authenticates, re-sends
-  `USE <database>` and clears the prepared-statement cache. Because the failed
+  `USE <database>` and clears the prepared-statement cache — except inside
+  `transaction()`, which never reconnects mid-transaction. Because the failed
   statement *may* have executed, the driver never retries it for you: retry a
   write only if it is idempotent. `isUsable()` reports the state.
 - **Protocol desync** (an unexpected frame): the driver drops the connection
@@ -447,7 +537,8 @@ streaming: …`, `server does not support parameterised streaming (skaidb >=
 0.330): …`, `statement expects N parameters, got M`, `no parameter for
 $N`, `cannot bind value of type …`, `cannot bind NaN/Infinity`, `bigint …
 does not fit a 64-bit integer`, `stream abandoned with too much data left to
-drain`.
+drain`, `connection lost during a transaction`, `a transaction is already
+running on this connection`, `attempts must be >= 1`.
 
 ## Type mapping
 
@@ -478,7 +569,8 @@ arrays/objects cannot be bound at all.
   `stream()` a server with the streaming opcode (an older one answers `server
   does not support streaming`) and, with values, ≥ 0.330 (an older one
   answers `server does not support parameterised streaming`), multiple
-  result sets a server with `EMIT`.
+  result sets a server with `EMIT`. A `COMMIT` refused for a conflict
+  (`TransactionConflictError`) comes from a standalone server ≥ 0.346.0.
   The Hello frame that fills the server's `drivers` table (`client_name`
   `nodejs`, `client_version` = this package's version) is ignored by older
   servers.

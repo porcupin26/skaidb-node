@@ -1,7 +1,8 @@
 // TypeScript declarations for the skaidb Node.js driver (skaidb.js).
 //
 // The runtime is plain CommonJS; these declarations cover its whole public
-// surface: Client, Pool, SkaidbError, CONSISTENCY and the option/result shapes.
+// surface: Client, Pool, SkaidbError, TransactionConflictError, CONSISTENCY
+// and the option/result shapes.
 
 /// <reference types="node" />
 
@@ -129,6 +130,25 @@ export interface BatchOptions {
   consistency?: Consistency;
 }
 
+export interface TransactionOptions {
+  /**
+   * How many times the transaction may run in all: a `COMMIT` refused with
+   * a `TransactionConflictError` runs it again from `begin` until it has
+   * run this many times. Default `3`; below 1 is refused before anything is
+   * sent.
+   */
+  attempts?: number;
+  /**
+   * The opening statement, sent verbatim. Default `'BEGIN'` (a standalone
+   * server); a cluster takes `'BEGIN ATOMIC'` or
+   * `'BEGIN ATOMIC PARTITION (col = literal)'`.
+   */
+  begin?: string;
+}
+
+/** `pool.transaction()` options: the transaction's, plus the checkout's `affinity`. */
+export interface PoolTransactionOptions extends TransactionOptions, AcquireOptions {}
+
 /**
  * `client.stream(sql, values?, opts?)` — an async generator over the rows of
  * one statement; `stream(sql, opts)` is the same without values. The slots
@@ -233,6 +253,19 @@ export class Client {
    * preparable (SELECT/INSERT/UPDATE/DELETE) and idempotent.
    */
   batch(sql: string, rows: Value[][], opts?: BatchOptions): Promise<number>;
+
+  /**
+   * Run `body` in a transaction on this connection and resolve to what it
+   * returns: `opts.begin`, then `body(client)` (awaited), then `COMMIT`.
+   * If `begin` fails the body never runs and nothing else is sent. If the
+   * body throws, `ROLLBACK` is sent and the body's error is thrown
+   * unchanged. A `COMMIT` refused with a `TransactionConflictError` runs
+   * the whole transaction again, at once, up to `opts.attempts` runs in
+   * all, so the body must be safe to run more than once; any other `COMMIT`
+   * error is thrown as it is. A connection lost while the transaction is
+   * open is not re-dialled. Nothing else may use the client meanwhile.
+   */
+  transaction<T>(body: (client: Client) => Promise<T> | T, opts?: TransactionOptions): Promise<T>;
 
   /**
    * Stream a result set row by row while holding one chunk in memory:
@@ -364,11 +397,19 @@ export class Pool extends EventEmitter {
    * picks, or a new one dialed to it (falling back to the other members).
    */
   acquire(options?: AcquireOptions): Promise<Client>;
-  /** Return a connection; it is closed instead if broken, its member is not usable, or the pool is full. */
+  /**
+   * Return a connection; it is closed instead if broken, its member is not
+   * usable, the pool is full, or a `transaction()` may still be open on it.
+   */
   release(conn: Client): Promise<void>;
   /** Run `fn` with a checked-out connection and return it however `fn` ends. */
   withConnection<T>(fn: (conn: Client) => Promise<T> | T): Promise<T>;
   withConnection<T>(options: AcquireOptions, fn: (conn: Client) => Promise<T> | T): Promise<T>;
+  /**
+   * `Client.transaction()` on one checked-out connection, held for the
+   * whole transaction and returned afterwards; `body` gets that connection.
+   */
+  transaction<T>(body: (conn: Client) => Promise<T> | T, opts?: PoolTransactionOptions): Promise<T>;
   /** Every member as the pool sees it, in endpoint order. */
   members(): PoolMember[];
   /** Close the pool and every idle connection, and stop its probe/discovery timer. */
@@ -384,5 +425,14 @@ export class Pool extends EventEmitter {
 
 /** Every error the driver raises: statement errors, protocol errors, connection errors. */
 export class SkaidbError extends Error {}
+
+/**
+ * A statement error whose message starts with `transaction conflict:`: the
+ * server refused a `COMMIT` because another writer changed a row the
+ * transaction writes after its `BEGIN`. Nothing was applied, the
+ * transaction is over and the connection stays usable; running the whole
+ * transaction again from `BEGIN` is safe. `message` is the server's.
+ */
+export class TransactionConflictError extends SkaidbError {}
 
 export const CONSISTENCY: { readonly ONE: 0; readonly QUORUM: 1; readonly ALL: 2 };

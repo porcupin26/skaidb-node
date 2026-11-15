@@ -41,9 +41,10 @@ The package ships `skaidb.d.ts` (via `"types"` in `package.json`); no
 any Node project already has.
 
 ```ts
-import { Client, Pool, SkaidbError, CONSISTENCY,
+import { Client, Pool, SkaidbError, TransactionConflictError, CONSISTENCY,
          ClientOptions, PoolOptions, QueryResult, QueryConfig,
          StreamOptions, StreamEvent, SubscribeOptions, Value, Consistency,
+         TransactionOptions, PoolTransactionOptions,
          LoadBalancing, IdleOrder, AcquireOptions, PoolMember, MemberState } from '@skaidb/client';
 ```
 
@@ -76,12 +77,23 @@ argument, `PoolMember` (with `MemberState`) an entry of `pool.members()`,
 and `EjectEvent`/`ReadmitEvent` the pool's events; `QueryConfig` the
 object form of `query()`; `QueryResult<Row>` every result (with optional
 `columns` and `resultSets`); `StreamOptions`, `SubscribeOptions` and
-`StreamEvent` the streaming APIs. `Consistency` is
+`StreamEvent` the streaming APIs; `TransactionOptions` the options of
+`client.transaction()` and `PoolTransactionOptions` (the same plus
+`affinity`) those of `pool.transaction()`. `Consistency` is
 `0 | 1 | 2 | 'ONE' | 'QUORUM' | 'ALL'` (lowercase names also accepted).
 
 `client.stream` is declared as a callable — `(sql, opts?)` and
 `(sql, values?, opts?)` — with optional `columns`, `command` and `affected`
 properties, matching the runtime.
+
+`transaction<T>()` resolves to the type its body returns:
+
+```ts
+const left: number = await client.transaction(async (tx) => {
+  const res = await tx.query<{ qty: number }>('SELECT qty FROM stock WHERE id = $1', [7]);
+  return res.rows[0].qty;
+});
+```
 
 ### Errors
 
@@ -93,6 +105,9 @@ try {
   else throw e;
 }
 ```
+
+`TransactionConflictError` extends `SkaidbError`, so the check above still
+catches it; test for it first to tell a refused `COMMIT` apart.
 
 ### ESM
 

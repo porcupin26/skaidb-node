@@ -15,7 +15,7 @@ npm install @skaidb/client
 ```
 
 The package is `@skaidb/client`, so it is required as `@skaidb/client`. To
-install from GitHub instead, `npm install github:porcupin26/skaidb-node#v1.4.1`
+install from GitHub instead, `npm install github:porcupin26/skaidb-node#v1.5.0`
 pins a tag and `#main` follows the development branch; the module name is
 the same either way.
 
@@ -130,6 +130,24 @@ await client.batch('INSERT INTO users (id, name) VALUES ($1, $2)', [[1, 'Ada'], 
 ```
 
 One round-trip for all rows; each row autocommits on its own.
+
+## Transactions
+
+```js
+const left = await client.transaction(async (tx) => {
+  const { rows } = await tx.query('SELECT qty FROM stock WHERE id = $1', [7]);
+  await tx.query('UPDATE stock SET qty = $2 WHERE id = $1', [7, rows[0].qty - 1]);
+  return rows[0].qty - 1;
+});
+```
+
+`BEGIN`, your function, `COMMIT` — on one connection — or `ROLLBACK` if the
+function throws. When the server refuses the `COMMIT` because another writer
+changed a row the transaction writes, the whole function runs again (three
+runs in all by default), so it must be safe to run more than once. On a
+cluster pass the opening statement, `{ begin: 'BEGIN ATOMIC' }`; on a pool
+use `pool.transaction()`. See
+[the reference](api.md#clienttransactionbody-opts-promiset).
 
 ## Next
 

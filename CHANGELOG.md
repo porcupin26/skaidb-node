@@ -4,6 +4,43 @@ All notable changes to the skaidb Node.js driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-11-15
+
+### Added
+- **`client.transaction(body, { attempts, begin })`** runs `body` in a
+  transaction on the client's connection and resolves to its value: `BEGIN`
+  (or the `begin` text, sent verbatim — `BEGIN ATOMIC …` on a cluster),
+  `body(client)`, `COMMIT`. A `COMMIT` the server refuses for a conflict
+  runs the whole transaction again from `BEGIN`, at once, until it has run
+  `attempts` times in all (default 3); the last conflict is thrown, so
+  `body` must be safe to run more than once. If `body` throws, `ROLLBACK`
+  is sent and `body`'s error is thrown unchanged, whatever the `ROLLBACK`
+  answers, with no retry. If `BEGIN` fails, `body` never runs and nothing
+  else is sent. Any other `COMMIT` error is thrown without a retry or a
+  `ROLLBACK`. `attempts` below 1 is refused before anything is sent.
+  While the transaction is open the client does not reconnect: a statement
+  that finds the connection gone fails with `connection lost during a
+  transaction` rather than running on a new connection, outside the
+  transaction. A second `transaction()` on a client that has one running is
+  refused.
+- **`pool.transaction(body, { attempts, begin, affinity })`**: the same on
+  one checked-out connection, held for the whole transaction and returned
+  afterwards.
+- **`TransactionConflictError`**, a `SkaidbError` subclass, for a statement
+  error whose message starts with `transaction conflict:` — a standalone
+  server ≥ 0.346.0 refusing a `COMMIT` because another writer changed a row
+  the transaction writes after its `BEGIN`. `query()`, `batch()` and
+  `stream()` raise it; the message is the server's, the connection stays
+  usable, and code that catches `SkaidbError` keeps catching it.
+- The declarations gain `Client.transaction`, `Pool.transaction`,
+  `TransactionOptions`, `PoolTransactionOptions` and
+  `TransactionConflictError`.
+
+### Changed
+- `pool.release()` closes, instead of pooling, a connection that a
+  `transaction()` may still be open on: one released while its transaction
+  is running, or after one whose `ROLLBACK` failed.
+
 ## [1.4.1] - 2026-10-31
 
 ### Fixed
