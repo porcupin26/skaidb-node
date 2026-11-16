@@ -515,6 +515,7 @@ class Client {
     // the ones its body left open.
     this._streams = new Set();
     this._connected = null;    // 'host:port' reached by the last successful dial
+    this._dialling = null;     // the connect() in flight, a promise
     // The pool that owns this client (see Pool): told each round trip's
     // latency, each transport failure and each write, and asked for the dial
     // order when the client re-dials. null outside a pool; the other _pool*
@@ -529,8 +530,16 @@ class Client {
    * Connect, trying each seed until one connects AND authenticates — a node
    * that accepts TCP while unhealthy must not swallow the attempt.
    */
-  async connect() {
-    return this._connectVia(shuffle(this.seeds.slice()));
+  connect() {
+    // One dial at a time: a call made while one is running gets that dial's
+    // outcome. Two of them would share the client's handshake state — each
+    // login reading the other's frames — and leave both sockets open.
+    if (this._dialling === null) {
+      const done = () => { this._dialling = null; };
+      this._dialling = this._connectVia(shuffle(this.seeds.slice()));
+      this._dialling.then(done, done);
+    }
+    return this._dialling;
   }
 
   /**

@@ -967,6 +967,36 @@ test('connect() called again closes the connection it replaces', async () => {
   });
 });
 
+test('connect() called while a connect() is running joins that dial instead of racing it', async () => {
+  await withServer({ handle: (req) => (req.op === 1 ? F.rows(['v'], [[1]]) : undefined) }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    // Two dials on one client would share its handshake state: one login
+    // read the other's challenge, and both sockets were left open.
+    await settles(Promise.all([c.connect(), c.connect(), c.connect()]));
+    assert.equal(c.isUsable(), true);
+    assert.equal(srv.connections, 1);
+    assert.deepEqual((await c.query('SELECT 1')).rows, [{ v: 1 }]);
+    // The dial over, connect() dials again as it always did.
+    await c.connect();
+    assert.equal(srv.connections, 2);
+    await until(() => srv.sockets.size === 1);
+    await c.end();
+    await until(() => srv.sockets.size === 0);
+
+    // A dial that fails fails for everyone who joined it, and leaves nothing behind.
+    srv.refuse = true;
+    const d = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    const both = await settles(Promise.allSettled([d.connect(), d.connect()]));
+    assert.deepEqual(both.map((r) => r.status), ['rejected', 'rejected']);
+    assert.equal(both[0].reason, both[1].reason);
+    srv.refuse = false;
+    await d.connect();
+    assert.deepEqual((await d.query('SELECT 1')).rows, [{ v: 1 }]);
+    await d.end();
+    await until(() => srv.sockets.size === 0);
+  });
+});
+
 test('a statement the cache did not keep is closed on the connection that prepared it, or not at all', async () => {
   const server = idsPerConnection();
   await withServer({ handle: server.handle }, async (srv) => {

@@ -57,7 +57,8 @@ failed)`) when the handshake failed.
 
 Called again on a client that still has a connection, it dials a new one
 and closes the one it replaces; a statement that was waiting for its answer
-there rejects with `connection closed`.
+there rejects with `connection closed`. A call made while a `connect()` is
+still running starts no second dial: it settles as that one does.
 
 ### `client.query(text, values?)` · `client.query(config, values?)`
 
