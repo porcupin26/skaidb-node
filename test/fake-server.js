@@ -98,10 +98,14 @@ class FakeServer {
    *                  answered with Ddl unless the handler returns something.
    * opts.host      — address to listen on (default '127.0.0.1'); 'localhost'
    *                  binds whichever family a client's lookup tries first
+   * opts.allowHalfOpen — true: a connection stays open for reading after its
+   *                  sending side was ended (`sock.end()`), so a test can
+   *                  half-close one and see what still arrives on it
    */
   constructor(opts = {}) {
     this.password = opts.password === undefined ? 'secret' : opts.password;
     this.host = opts.host || '127.0.0.1';
+    this.allowHalfOpen = opts.allowHalfOpen === true;
     this.handle = opts.handle || (() => F.ddl());
     this.iterations = 1000;
     this.requests = [];        // every parsed post-handshake request, in order
@@ -115,7 +119,7 @@ class FakeServer {
 
   start() {
     return new Promise((resolve) => {
-      this.server = net.createServer((sock) => this._onConnection(sock));
+      this.server = net.createServer({ allowHalfOpen: this.allowHalfOpen }, (sock) => this._onConnection(sock));
       this.server.listen(0, this.host, () => { this.port = this.server.address().port; resolve(this); });
     });
   }
