@@ -477,6 +477,43 @@ test('transaction: after the connection is lost, a body that catches the error a
   }
 });
 
+test('transaction: the opening statement re-dials a connection lost while the client was idle, as any statement does', async () => {
+  await withClient({}, async (c, rec, srv) => {
+    await c.query('SELECT 1');
+    srv.closeAll();                                      // the node restarts while the client is idle
+    await until(() => !c.isUsable());
+    const value = await c.transaction(async (tx) => { await tx.query('UPDATE a SET v = 1'); return 'ran'; });
+    assert.equal(value, 'ran');
+    assert.deepEqual(rec.sqls(), ['SELECT 1', 'BEGIN', 'UPDATE a SET v = 1', 'COMMIT']);
+    assert.equal(srv.connections, 2);
+    assert.notEqual(rec.seen[1].sock, rec.seen[0].sock);                   // BEGIN went out on the new connection …
+    assert.equal(new Set(rec.seen.slice(1).map((s) => s.sock)).size, 1);   // … and the whole transaction with it
+
+    // A loss the client has not noticed yet: the opening statement fails as a
+    // statement does in that state, and the next call re-dials — both alike.
+    for (const run of [() => c.query('SELECT 2'), () => c.transaction(async () => 'ran again')]) {
+      srv.closeAll();
+      const first = await run().catch((e) => e);
+      assert.ok(isTransport(first) && /^connection (closed|lost)$/.test(first.message), String(first));
+      assert.ok(await run());
+    }
+    assert.equal(srv.connections, 4);
+  });
+  // The pool's twin: the idle connection is found dead at checkout and another is dialled.
+  await withPool({}, async (pool, rec, srv) => {
+    const idle = await pool.acquire();
+    await pool.release(idle);
+    srv.closeAll();
+    await until(() => !idle.isUsable());
+    const value = await pool.transaction(async (tx) => { await tx.query('UPDATE a SET v = 1'); return tx; });
+    assert.notEqual(value, idle);
+    assert.deepEqual(rec.sqls(), ['BEGIN', 'UPDATE a SET v = 1', 'COMMIT']);
+    assert.equal(rec.sockets(), 1);
+    assert.equal(srv.connections, 2);
+    assert.deepEqual([pool.members()[0].inUse, pool.members()[0].idle], [0, 1]);
+  });
+});
+
 // ---- the pool ---------------------------------------------------------------
 
 // Runs `fn(pool, rec, srv)` with a pool over one fake member.
