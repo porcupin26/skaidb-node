@@ -524,3 +524,137 @@ test('transactionStatement reads a BEGIN, and exactly COMMIT or ROLLBACK', () =>
   ];
   for (const [sql, want] of cases) assert.equal(I.transactionStatement(sql), want, JSON.stringify(sql));
 });
+
+// ---- J: a pool hands every borrower its own session state --------------------
+
+// A pool of one connection, so that every borrower gets the same one.
+async function withPool(opts, fn) {
+  return withSession(async (server, srv) => {
+    const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret', maxsize: 1, ...opts });
+    try { return await fn(pool, server, srv); } finally { await pool.end(); }
+  });
+}
+
+test('Pool: a connection reaches the next borrower in the pool\'s own session — its database, no scan budget, no consistency override', async () => {
+  // Without a database option the pool's database is the one every new
+  // connection starts in.
+  for (const [opts, home] of [[{}, 'default'], [{ database: 'app' }, 'app']]) {
+    await withPool(opts, async (pool, server, srv) => {
+      const first = await pool.acquire();
+      await first.query('USE other');
+      await first.query('SET SCAN BUDGET ROWS 1');
+      await first.query('SET CONSISTENCY ALL');
+      server.log.length = 0;
+      await pool.release(first);
+      const second = await pool.acquire();
+      assert.equal(second, first, home);
+      // In the pool's database, not refused for a scan budget, at its own consistency.
+      assert.deepEqual(await where(second), { db: home, consistency: null, txn: false, ids: [] }, home);
+      // The server saw the connection put back before that statement, when it was returned.
+      assert.deepEqual(server.log, [`1: USE "${home}"`, '1: SET SCAN BUDGET DEFAULT', '1: SET CONSISTENCY DEFAULT',
+        '1: SELECT count(*) FROM notes'], home);
+      // The notes went with it: re-dialled under the second borrower, the
+      // connection is given the pool's session, not the first borrower's.
+      await lose(second, srv);
+      server.log.length = 0;
+      assert.deepEqual(await where(second), { db: home, consistency: null, txn: false, ids: [] }, home);
+      assert.deepEqual(server.log, (home === 'default' ? [] : ['2: USE "app"']).concat('2: SELECT count(*) FROM notes'), home);
+      await pool.release(second);
+      assert.equal(srv.connections, 2, home);
+    });
+  }
+});
+
+test('Pool: only what a borrower changed is put back, and one that changed nothing costs no round trip', async () => {
+  await withPool({ database: 'app' }, async (pool, server) => {
+    const borrow = async (...statements) => {
+      const conn = await pool.acquire();
+      server.log.length = 0;
+      for (const sql of statements) await conn.query(sql);
+      await pool.release(conn);
+      return server.log.slice(statements.length).map((l) => l.replace(/^\d+: /, ''));
+    };
+    assert.deepEqual(await borrow('SELECT 1', 'INSERT INTO t (id) VALUES (1)'), []);
+    assert.deepEqual(await borrow(), []);
+    assert.deepEqual(await borrow('SET SCAN BUDGET ROWS 5 BYTES 100'), ['SET SCAN BUDGET DEFAULT']);
+    assert.deepEqual(await borrow('SET CONSISTENCY ONE'), ['SET CONSISTENCY DEFAULT']);
+    assert.deepEqual(await borrow('USE other'), ['USE "app"']);
+    // What the borrower put back itself is not put back again.
+    assert.deepEqual(await borrow('USE other', 'SET SCAN BUDGET ROWS 5', 'SET CONSISTENCY ALL',
+      'set consistency default', 'SET SCAN BUDGET DEFAULT;', 'use app'), []);
+    assert.deepEqual(await borrow('USE other', 'USE "app"', 'SET CONSISTENCY ALL'), ['SET CONSISTENCY DEFAULT']);
+    assert.deepEqual(await pool.withConnection(where), { db: 'app', consistency: null, txn: false, ids: [1] });
+    assert.equal(pool.members()[0].idle, 1);
+  });
+  // No database option, and a borrower that names the default one itself.
+  await withPool({}, async (pool, server) => {
+    await pool.withConnection((c) => c.query('USE default'));
+    assert.deepEqual(server.log, ['1: USE default']);
+    assert.equal((await pool.withConnection(where)).db, 'default');
+  });
+});
+
+test('Pool: a connection that cannot be put back is closed, and the next borrower gets a new one', async () => {
+  // An older server has no SET CONSISTENCY DEFAULT.
+  const noDefault = 'parse error: SET CONSISTENCY takes ONE, QUORUM, or ALL';
+  await withPool({}, async (pool, server, srv) => {
+    server.refuse.set('SET CONSISTENCY DEFAULT', noDefault);
+    const first = await pool.acquire();
+    await first.query('USE other');
+    await first.query('SET SCAN BUDGET ROWS 1');
+    await first.query('SET CONSISTENCY ALL');
+    await pool.release(first);
+    assert.equal(first.isUsable(), false);
+    assert.equal(pool.members()[0].idle, 0);
+    await until(() => srv.sockets.size === 0);
+    const second = await pool.acquire();
+    assert.notEqual(second, first);
+    assert.deepEqual(await where(second), { db: 'default', consistency: null, txn: false, ids: [] });
+    await pool.release(second);
+    assert.equal(srv.connections, 2);
+    // The same for each of the others.
+    for (const [refused, ...statements] of [['USE "default"', 'USE other'], ['SET SCAN BUDGET DEFAULT', 'SET SCAN BUDGET ROWS 1'],
+      ['ROLLBACK', 'BEGIN']]) {
+      server.refuse.clear();
+      server.refuse.set(refused, `refused: ${refused}`);
+      const conn = await pool.acquire();
+      for (const sql of statements) await conn.query(sql);
+      await pool.release(conn);
+      assert.equal(conn.isUsable(), false, refused);
+      assert.equal(pool.members()[0].idle, 0, refused);
+      server.refuse.clear();
+      assert.deepEqual(await pool.withConnection(where), { db: 'default', consistency: null, txn: false, ids: [] }, refused);
+    }
+  });
+});
+
+test('Pool: a transaction a borrower opened with BEGIN and left open is rolled back before the next borrower gets the connection', async () => {
+  await withPool({}, async (pool, server, srv) => {
+    const first = await pool.acquire();
+    await first.query('BEGIN');
+    await insert(first, 1);
+    await first.query('USE other');
+    await pool.release(first);
+    // ROLLBACK first, then the rest.
+    assert.deepEqual(server.log.slice(-2), ['1: ROLLBACK', '1: USE "default"']);
+    const second = await pool.acquire();
+    assert.equal(second, first);
+    await insert(second, 2);                                // not inside the first borrower's transaction
+    assert.deepEqual(await where(second), { db: 'default', consistency: null, txn: false, ids: [2] });
+    await pool.release(second);
+    // One whose connection was lost under it: nothing to send, nothing to pool.
+    const third = await pool.acquire();
+    await third.query('BEGIN');
+    await lose(third, srv);
+    server.log.length = 0;
+    await pool.release(third);
+    assert.deepEqual(server.log, []);
+    assert.equal(pool.members()[0].idle, 0);
+    assert.deepEqual(await pool.withConnection(where), { db: 'default', consistency: null, txn: false, ids: [2] });
+    // transaction() on a pooled connection leaves nothing to put back.
+    server.log.length = 0;
+    await pool.transaction((tx) => insert(tx, 3));
+    assert.deepEqual(server.log.map((l) => l.replace(/^\d+: /, '')), ['BEGIN', 'INSERT INTO t (id) VALUES (3)', 'COMMIT']);
+    assert.equal(pool.members()[0].idle, 1);
+  });
+});

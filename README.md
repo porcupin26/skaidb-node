@@ -471,11 +471,19 @@ open on, or that a stream left open still holds. Every `Client` option passes th
 name the starting members. `pool.transaction()` runs a
 [transaction](#transactions) on one checked-out connection.
 
-With a `database` option every borrower starts in that database: a
-connection whose borrower moved it elsewhere with `USE` is put back before
-it is pooled. Without the option a pooled connection stays where its last
-borrower left it, so name the database in the pool's options, or in each
-statement, when it matters.
+Every borrower gets the pool's own session: the pool's `database` — without
+the option the server's `default` database, where every new connection
+starts — with no scan budget, no consistency override and no transaction
+open. What a borrower did to the session is undone when its connection
+comes back: a transaction it opened with `BEGIN` and never ended is rolled
+back, a `USE` is answered with `USE <the pool's database>`, a `SET SCAN
+BUDGET` with `SET SCAN BUDGET DEFAULT`, a `SET CONSISTENCY` with `SET
+CONSISTENCY DEFAULT`. Only what is needed is sent, so a borrower that
+changed nothing costs no round trip, and a connection that cannot be put
+back is closed instead of pooled (a server before 0.349 has no `SET
+CONSISTENCY DEFAULT`). So choose the database in the pool's options, or
+with a `USE` at the start of each checkout: it does not outlive the
+checkout.
 
 ### Balancing across members
 

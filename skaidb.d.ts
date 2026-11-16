@@ -422,9 +422,13 @@ export class Pool extends EventEmitter {
   acquire(options?: AcquireOptions): Promise<Client>;
   /**
    * Return a connection; it is closed instead if broken, its member is not
-   * usable, the pool is full, or a `transaction()` may still be open on it.
-   * One its borrower moved to another database with `USE` is put back into
-   * the pool's `database` first.
+   * usable, the pool is full, a `transaction()` may still be open on it or
+   * an open stream still holds it. What its borrower did to the session is
+   * undone first — a transaction left open is rolled back, and the
+   * connection goes back into the pool's database (`default` without the
+   * option) with no scan budget and no consistency override — so every
+   * borrower starts in the pool's own session; a connection that cannot be
+   * put back is closed.
    */
   release(conn: Client): Promise<void>;
   /** Run `fn` with a checked-out connection and return it however `fn` ends. */

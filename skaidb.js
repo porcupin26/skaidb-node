@@ -2023,7 +2023,10 @@ function byEndpoint(a, b) {
  * a burst creates extras and the surplus is closed on return. Every Client
  * option passes through, so pooled connections inherit TLS, the session
  * database and the default consistency; `seeds` (or `host`/`port`) name the
- * starting members.
+ * starting members. Every borrower gets the pool's own session — its
+ * database (the server's default one without the option), no scan budget,
+ * no consistency override, no transaction open: what a borrower changed
+ * with statements of its own is undone when the connection comes back.
  *
  * Load balancing (milliseconds for every duration):
  *
@@ -2100,8 +2103,9 @@ class Pool extends EventEmitter {
     // long: the driver has no read timeout, and a member that never answers
     // must not wedge a probe or a refresh for good.
     this._answerTimeout = clientOpts.connectTimeout || 10000;
-    // The database every pooled connection is in: one that a borrower left
-    // in another is put back before the next borrower gets it.
+    // The database every pooled connection is in — null for the one a new
+    // connection starts in: one that a borrower left in another is put back
+    // before the next borrower gets it (see _home).
     this._database = clientOpts.database || null;
     this._port = clientOpts.port || 7000;
     this._members = new Map();         // 'host:port' -> Member
@@ -2172,8 +2176,9 @@ class Pool extends EventEmitter {
 
   /**
    * Return a connection, closing it if it is broken, its member is ejected,
-   * not ready or gone, the pool is full, or a transaction() may still be
-   * open on it.
+   * not ready or gone, the pool is full, a transaction() may still be open
+   * on it, a stream left open still holds it, or it cannot be put back
+   * into the pool's own session.
    */
   async release(conn) {
     const m = this._members.get(conn._poolEp);
@@ -2190,17 +2195,48 @@ class Pool extends EventEmitter {
     // statements would wait behind it. Such a connection is closed too.
     const keep = () => !this.closed && settled && conn.isUsable() && m && this._usable(m)
       && this._idle.length < this.maxsize && conn._streams.size === 0;
-    // The borrower entered another database with USE: the next borrower
-    // gets the pool's own. If that cannot be entered again the connection
-    // is not pooled.
-    if (keep() && this._database !== null && conn.database !== this._database) {
-      await this._bounded(conn, conn.query(useStatement(this._database))).catch(() => {});
-    }
-    if (keep() && (this._database === null || conn.database === this._database)) {
+    // What the borrower did to the session is undone: the next borrower
+    // gets the pool's own. A connection that cannot be put back is not
+    // pooled.
+    if (keep() && await this._home(conn) && keep()) {
       this._idle.push(conn);
       return;
     }
     await conn.end().catch(() => {});
+  }
+
+  /**
+   * Put a connection that comes back into the session every borrower
+   * starts in: no transaction open, the pool's database — its `database`
+   * option, or without one the database every new connection starts in —
+   * no scan budget and no consistency override. The client's notes say
+   * what its borrower changed, and only that is sent, so a borrower that
+   * changed nothing costs no round trip; the statements go through the
+   * client like any other, which clears the notes with them. Resolves to
+   * whether the connection is there: one of them failing (an older server
+   * has no SET CONSISTENCY DEFAULT; the connection went) means it is not.
+   */
+  async _home(conn) {
+    const send = (sql) => this._bounded(conn, conn.query(sql));
+    const home = this._database === null ? 'default' : this._database;
+    const away = () => conn.database !== this._database && !(this._database === null && conn.database === home);
+    try {
+      // A transaction opened with a BEGIN statement and never ended: the
+      // next borrower's statements must not join it.
+      if (conn._handTxn !== null) await send('ROLLBACK');
+      if (away()) {
+        await send(useStatement(home));
+        // The pool's own way of saying it: a re-dial enters the option's
+        // database, and none when the pool names none.
+        if (!away()) conn.database = this._database;
+      }
+      if (conn._settings.scanBudget !== null) await send('SET SCAN BUDGET DEFAULT');
+      if (conn._settings.consistency !== null) await send('SET CONSISTENCY DEFAULT');
+    } catch (_) {
+      return false;
+    }
+    return conn._handTxn === null && !away()
+      && conn._settings.scanBudget === null && conn._settings.consistency === null;
   }
 
   /**
