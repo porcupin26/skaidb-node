@@ -4,6 +4,118 @@ All notable changes to the skaidb Node.js driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.2] - 2026-11-16
+
+### Fixed
+- `SET SCAN BUDGET …` and `SET CONSISTENCY …` sent as statements survive a
+  reconnect. Both are state of the connection, and a client replaces a lost
+  connection on its next statement: after a server restart a scan that
+  `SET SCAN BUDGET ROWS 1` had made fail ran, and an application that had
+  asked for `ALL` read at each request's own level again, with nothing to
+  say so. The client now notes the last statement of each kind the server
+  accepted (through `query()` or `stream()`, as one statement of its own)
+  and sends it again on every new connection, after the `USE` and before
+  the statement that re-dialled — the `SET CONSISTENCY` first, then the
+  `SET SCAN BUDGET`. `SET … DEFAULT` clears the note. If the server refuses
+  a setting on the new connection the statement fails with that error and
+  is not sent.
+- A transaction opened with a `BEGIN` statement is not carried to a new
+  connection. Only `transaction()` knew that a transaction dies with its
+  connection; after a hand-written `BEGIN`, a lost connection was replaced
+  like any other and the rest of the transaction ran on a session with no
+  transaction open, each statement committing on its own, until the
+  `COMMIT` failed with `no transaction in progress`. The client now notes a
+  `BEGIN` the server accepted (`BEGIN`, `BEGIN TRANSACTION`, `BEGIN ATOMIC
+  …`) and the `COMMIT [TRANSACTION]` / `ROLLBACK [TRANSACTION]` that ends
+  it. While it is open a lost connection is not replaced: the statement
+  under which it was lost fails with the connection error, every later one
+  with `connection lost during a transaction`, and none is sent — not after
+  a `connect()` by hand either. The application ends it and the client
+  settles that itself: `ROLLBACK` succeeds without being sent (the server
+  dropped the transaction with the connection), `COMMIT` fails with
+  `connection lost during a transaction: COMMIT was not sent and nothing
+  was committed`, and the next statement reconnects. When the connection
+  goes while the `COMMIT` itself is in flight the outcome is unknown and
+  the error says so: `connection lost under COMMIT: it is not known whether
+  the transaction was committed (…)`. `transaction()` is unchanged.
+- A pool hands every borrower its own session. A pooled connection kept
+  its last borrower's `SET SCAN BUDGET` and `SET CONSISTENCY` — the next
+  borrower's scan was refused for a limit it never set, or read at another
+  consistency — and a transaction opened with `BEGIN` and never ended,
+  which the next borrower's statements joined. `release()` now undoes what
+  the borrower changed before the connection is pooled: `ROLLBACK` for a
+  transaction left open, `USE <the pool's database>`, `SET SCAN BUDGET
+  DEFAULT`, `SET CONSISTENCY DEFAULT` — only the ones needed, so a borrower
+  that changed nothing costs no round trip. A connection that cannot be
+  put back is closed instead; against a server before 0.349, which has no
+  `SET CONSISTENCY DEFAULT`, that is every connection a borrower set a
+  consistency on.
+- A `USE` is no longer held back by the database it leaves. Once the
+  database a client was in had been dropped and its connection lost, every
+  statement failed at the reconnect's `USE` of that database — rightly, it
+  must not run elsewhere — but so did `USE other`, and the application
+  could only get out by building a new client. A `USE` that reconnects is
+  now sent without re-entering the old database first.
+- When the session database (or a setting) is refused on a new connection,
+  the error is the server's — `database "app" does not exist`, a statement
+  error — and no longer `no reachable endpoint in <seeds>: database "app"
+  does not exist`: the endpoint had been reached and had answered. The
+  same for `connect()` with a `database` option that does not exist. A
+  seed that could not be reached no longer hides the answer of one that
+  was.
+- A close that arrived while the event loop was busy is seen before the
+  next statement is written. The server closing an idle connection — a
+  restart, a failover, an idle timeout — reaches a Node program as an
+  event of the socket; when it arrived while the application kept the
+  event loop busy and its next act was a statement, the request was
+  written to the dead connection and failed with `connection closed` (or
+  `connection lost: write ECONNRESET`), and a pool handed such a
+  connection out. A connection that has been silent for more than a
+  millisecond is now given a turn of the event loop before a request is
+  written on it and before a pool hands it out, which costs no round trip;
+  statements sent back to back are not delayed.
+- Data found waiting on an idle connection is no longer read as the next
+  statement's answer. A frame the server sent that no statement had asked
+  for was kept, the next statement took it for its own reply, and every
+  statement after that received the answer of the one before it. Such a
+  connection is now dropped and the statement runs on a new one.
+- `connect()` called again on a client that is still connected closes the
+  connection it replaces. The old socket stayed open on the server until
+  the process ended, and `end()` closed only the new one.
+- `connect()` called while another `connect()` on the same client is
+  running joins that dial. Two dials shared the client's handshake state:
+  one failed with `bad handshake challenge`, the other hung until its
+  timeout, and both sockets were left open.
+- `connect()` on a client that was ended rejects with `connection is
+  closed` and dials nothing; it walked every seed and then rejected with
+  `no reachable endpoint in …: connection is closed`.
+- A `connect()` that failed always leaves the client not connected. One
+  that was hung up on in the middle of the handshake left it in the state
+  of a client whose connection was lost, so the next statement dialled by
+  itself and ran; one that was refused, denied or timed out did not.
+- `pool.acquire()` with `discover: true` no longer dials for good when a
+  member takes the login and then never answers `SHOW ENDPOINTS`. After
+  three new connections in a row were lost that way it rejects with `every
+  new connection broke during member discovery`; the pool's background
+  refresh stops the same way.
+- A pooled connection released with a stream still open on it is closed
+  instead of pooled. The stream holds the connection's statement queue, so
+  the next borrower's first statement never settled.
+- A statement that is in flight when `end()` is called rejects with
+  `connection is closed` when the connection closes without an answer. It
+  stayed pending for the life of the process; one the server does answer
+  still resolves.
+
+### Changed
+- On a pool without a `database` option a borrower's `USE` no longer
+  carries over to later borrowers: every borrower starts in the server's
+  `default` database, where a new connection starts. Name the database in
+  the pool's options, or send `USE` at the start of each checkout.
+- After a connection is lost inside a transaction opened with a `BEGIN`
+  statement, statements fail with `connection lost during a transaction`
+  until the application sends `ROLLBACK` (or `COMMIT`); they used to run
+  on a new connection, outside the transaction.
+
 ## [1.5.1] - 2026-11-16
 
 ### Fixed
