@@ -537,16 +537,21 @@ Every error the driver raises is a `SkaidbError` (an `Error` subclass).
   (`isUsable()` → false) rather than hand the next caller a misaligned reply,
   and the next statement reconnects.
 - `end()` is terminal: a closed client never reconnects (`connection is closed`).
+- A client that has not connected dials nothing on its own: until
+  `connect()` has resolved, a statement rejects with `not connected: await
+  connect() first`.
 
 Common messages: `connect failed: …`, `connect timeout`, `no reachable
 endpoint in …`, `authentication denied: …`, `server signature mismatch
 (mutual auth failed)`, `cannot read tlsCa …`, `cannot read tlsClientCert …`, `server does not support
 streaming: …`, `server does not support parameterised streaming (skaidb >=
 0.330): …`, `statement expects N parameters, got M`, `no parameter for
-$N`, `cannot bind value of type …`, `cannot bind NaN/Infinity`, `bigint …
-does not fit a 64-bit integer`, `stream abandoned with too much data left to
-drain`, `connection lost during a transaction`, `a transaction is already
-running on this connection`, `attempts must be >= 1`.
+$N`, `cannot bind value of type …`, `cannot bind NaN/Infinity`, `cannot bind
+an invalid Date`, `bigint … does not fit a 64-bit integer`, `stream
+abandoned with too much data left to drain`, `not connected: await connect()
+first`, `connection lost during a transaction`, `the transaction body left a
+stream open: …`, `a transaction is already running on this connection`,
+`attempts must be >= 1`.
 
 ## Type mapping
 
