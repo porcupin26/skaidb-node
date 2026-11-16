@@ -154,6 +154,95 @@ test('an unpreparable statement falls back to client-side literals', async () =>
   });
 });
 
+// The server's prepared-statement table as the real one keeps it: `max` slots
+// per connection, a closed slot is reused, and a prepare that finds the table
+// full is refused. Statements sent as text are recorded in `texts`.
+function statementTable(max = 256) {
+  const slots = [];                                    // id -> the statement's text, null once closed
+  const texts = [];
+  const stats = { peak: 0, refused: 0 };
+  const open = () => slots.filter((s) => s !== null).length;
+  const unknown = (id) => F.error(`unknown prepared statement id ${id}`);
+  const handle = (req) => {
+    switch (req.op) {
+      case 1: texts.push(req.sql); return F.ddl();
+      case 2: {
+        let id = slots.indexOf(null);
+        if (id < 0) {
+          if (slots.length >= max) {
+            stats.refused++;
+            return F.error(`too many prepared statements (max ${max}); close some first`);
+          }
+          id = slots.length;
+          slots.push(null);
+        }
+        slots[id] = req.sql;
+        stats.peak = Math.max(stats.peak, open());
+        // `AS OF ?` is not a parameter to the server: it counts the others.
+        return F.prepared(id, (req.sql.replace(/AS OF \?/g, '').match(/\?/g) || []).length);
+      }
+      case 3: return slots[req.id] ? F.mutation(1) : unknown(req.id);
+      case 4: {
+        if (!slots[req.id]) return unknown(req.id);
+        slots[req.id] = null;
+        return F.ddl();
+      }
+      case 7: return slots[req.id] ? F.mutation(req.rows.length) : unknown(req.id);
+      default: return undefined;                       // Hello -> Ddl
+    }
+  };
+  return { handle, texts, stats, open };
+}
+
+test('a statement the prepared cache has no room for is closed after it ran, so the server\'s statement table never fills', async () => {
+  const table = statementTable();
+  await withServer({ handle: table.handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    // More distinct parameterised texts than the server keeps per connection.
+    for (let i = 0; i < 300; i++) {
+      assert.equal((await c.query(`UPDATE t SET v = $1 WHERE ${i} = ${i}`, [i])).rowCount, 1);
+    }
+    assert.equal(table.stats.refused, 0);
+    assert.equal(table.open(), 240);                   // the cache, and nothing else
+    assert.ok(table.stats.peak <= 241, `peak ${table.stats.peak}`);
+    // Each of the 60 that did not fit was closed, by its own id, right after it ran.
+    const closes = srv.requests.filter((q) => q.op === 4);
+    assert.equal(closes.length, 60);
+    for (const close of closes) {
+      const before = srv.requests[srv.requests.indexOf(close) - 1];
+      assert.deepEqual([before.op, before.id], [3, close.id]);
+    }
+    // A statement that is new to the connection still binds typed values: a
+    // Date as a Timestamp, a Buffer as Bytes, an array as an Array.
+    const params = [1, new Date(5), Buffer.from('z'), ['a']];
+    await c.query('INSERT INTO t (id, at, raw, tags) VALUES ($1, $2, $3, $4)', params);
+    assert.deepEqual(srv.requests.filter((q) => q.op === 3).pop().params, params);
+    // … and so does a batch, which closes its statement as well.
+    const rows = [[1, new Date(5)], [2, new Date(6)]];
+    assert.equal(await c.batch('INSERT INTO t (id, at) VALUES ($1, $2)', rows), 2);
+    assert.deepEqual(srv.requests.filter((q) => q.op === 7).pop().rows, rows);
+    assert.equal(table.open(), 240);
+    assert.deepEqual(table.texts, []);                 // nothing was ever sent as text
+    // A cached statement is not closed: it runs again on the id it has.
+    const prepares = srv.requests.filter((q) => q.op === 2).length;
+    await c.query('UPDATE t SET v = $1 WHERE 0 = 0', [7]);
+    assert.equal(srv.requests.filter((q) => q.op === 2).length, prepares);
+    assert.equal(srv.requests[srv.requests.length - 1].op, 3);
+    // A statement that fails after its prepare still gives its slot back.
+    const closed = () => srv.requests.filter((q) => q.op === 4).length;
+    const before = closed();
+    await assert.rejects(c.query('SELECT v FROM t AS OF $1', [new Date(5)]), /statement expects 0 parameters, got 1/);
+    await assert.rejects(c.query('UPDATE t SET v = $1 WHERE id = 9', [NaN]), /cannot bind NaN\/Infinity/);
+    await assert.rejects(c.batch('UPDATE t SET v = $1 WHERE id = $2', [[1, 2], [1]]), /no parameter for \$2/);
+    assert.equal(closed(), before + 3);
+    assert.equal(table.open(), 240);
+    assert.equal(c.isUsable(), true);
+    assert.equal(srv.connections, 1);
+    await c.end();
+  });
+});
+
 test('ResultSets from a CALL that EMITs land under resultSets with the last set as rows', async () => {
   const script = {
     'CALL report()': F.resultSets([[['a'], [[1], [2]]], [['b', 'c'], [['x', 'y']]]]),

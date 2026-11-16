@@ -91,7 +91,10 @@ Placeholders are `$1, $2, …`. Rules:
   The server's parameter count must equal the number of placeholders used
   (`statement expects N parameters, got M`).
 - Prepared statements are cached per connection by SQL text (240 entries).
-  The cache is dropped on reconnect since ids are connection-scoped.
+  The cache is dropped on reconnect since ids are connection-scoped. A
+  statement the full cache has no room for is prepared, run and closed each
+  time (one more round trip), so a connection never uses up the 256
+  statements the server keeps for it.
 - When the server refuses to prepare the statement (DDL, `USE`, other
   session statements), the driver falls back to interpolating the same
   values as **correctly quoted SQL literals**: strings with `'` doubled,

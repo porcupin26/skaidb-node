@@ -18,6 +18,11 @@ const { EventEmitter } = require('events');
 
 const CONSISTENCY = { ONE: 0, QUORUM: 1, ALL: 2 };
 
+// Prepared statements kept per connection, by SQL text. Below the 256 a
+// server keeps per connection, so a statement that does not fit can still be
+// prepared, run and closed.
+const PREPARED_CACHE_MAX = 240;
+
 // How much of an abandoned stream is worth reading out before dropping the
 // connection instead. The server sends ~256 KB row chunks, so this is a few
 // dozen of them: past that, transferring the remainder of a large scan costs
@@ -786,11 +791,15 @@ class Client {
         const q = toQmark(text, params);
         const p = await this._prepare(q.sql);
         if (p) {
-          if (p.nparams !== q.params.length) {
-            throw new SkaidbError(
-              `statement expects ${p.nparams} parameters, got ${q.params.length}`);
+          try {
+            if (p.nparams !== q.params.length) {
+              throw new SkaidbError(
+                `statement expects ${p.nparams} parameters, got ${q.params.length}`);
+            }
+            return await this._doPrepared(p.id, q.params, consistency, rowMode);
+          } finally {
+            if (!p.cached) await this._closePrepared(p.id);
           }
-          return this._doPrepared(p.id, q.params, consistency, rowMode);
         }
       }
       return this._doQuery(bindParams(text, params), consistency, rowMode);
@@ -1006,24 +1015,28 @@ class Client {
       const q = toQmark(sql, rows[0]);
       const p = await this._prepare(q.sql);
       if (!p) throw new SkaidbError('statement cannot be prepared, so it cannot be batched');
-      const ordered = rows.map((r) => toQmark(sql, r).params);
-      for (const r of ordered) {
-        if (r.length !== p.nparams) {
-          throw new SkaidbError(`batch row expects ${p.nparams} parameters, got ${r.length}`);
+      try {
+        const ordered = rows.map((r) => toQmark(sql, r).params);
+        for (const r of ordered) {
+          if (r.length !== p.nparams) {
+            throw new SkaidbError(`batch row expects ${p.nparams} parameters, got ${r.length}`);
+          }
         }
+        const head = Buffer.allocUnsafe(10);
+        head[0] = 7; head[1] = consistency;
+        head.writeUInt32LE(p.id, 2); head.writeUInt32LE(ordered.length, 6);
+        const parts = [head];
+        for (const r of ordered) {
+          const cnt = Buffer.alloc(2); cnt.writeUInt16LE(r.length, 0);
+          parts.push(cnt);
+          for (const v of r) { const b = encodeValue(v); parts.push(u32le(b.length), b); }
+        }
+        const res = await this._roundtrip(Buffer.concat(parts), 'object');
+        this._noteStatement(sql);
+        return res.rowCount || 0;
+      } finally {
+        if (!p.cached) await this._closePrepared(p.id);
       }
-      const head = Buffer.allocUnsafe(10);
-      head[0] = 7; head[1] = consistency;
-      head.writeUInt32LE(p.id, 2); head.writeUInt32LE(ordered.length, 6);
-      const parts = [head];
-      for (const r of ordered) {
-        const cnt = Buffer.alloc(2); cnt.writeUInt16LE(r.length, 0);
-        parts.push(cnt);
-        for (const v of r) { const b = encodeValue(v); parts.push(u32le(b.length), b); }
-      }
-      const res = await this._roundtrip(Buffer.concat(parts), 'object');
-      this._noteStatement(sql);
-      return res.rowCount || 0;
     });
     this._queryChain = run.catch(() => {});
     return run;
@@ -1098,10 +1111,14 @@ class Client {
   }
 
   /**
-   * Prepare `sql` on the SERVER, returning {id, nparams}. Cached per
+   * Prepare `sql` on the SERVER, returning {id, nparams, cached}. Cached per
    * connection — a prepared id only means anything on the connection that
    * created it. Returns null when the server declines the statement kind
    * (DDL, session statements), so the caller falls back to text binding.
+   *
+   * `cached` is false once the cache is full: the caller then closes the id
+   * when the statement has run (_closePrepared), since nothing will use it
+   * again and the server keeps at most 256 statements per connection.
    */
   async _prepare(sql) {
     const hit = this._prepared.get(sql);
@@ -1114,12 +1131,25 @@ class Client {
     if (tag === 4) {
       const id = r.u32();
       const nparams = r.u16();
-      const v = { id, nparams };
-      if (this._prepared.size < 240) this._prepared.set(sql, v);
+      const v = { id, nparams, cached: this._prepared.size < PREPARED_CACHE_MAX };
+      if (v.cached) this._prepared.set(sql, v);
       return v;
     }
     if (tag === 3) { r.text(); return null; }   // unpreparable: fall back
     throw new SkaidbError(`unexpected prepare response tag ${tag}`);
+  }
+
+  /**
+   * Free a prepared statement's slot on the server (OP_CLOSE). Best effort:
+   * the answer — Ddl, or an Error for an id the server does not have — is
+   * read and dropped, and a connection that is gone took its statements
+   * with it.
+   */
+  async _closePrepared(id) {
+    if (this._closed || this._broken) return;
+    const req = Buffer.allocUnsafe(5);
+    req[0] = 4; req.writeUInt32LE(id, 1);
+    try { await this._request(req); } catch (_) { /* the connection went, and the statement with it */ }
   }
 
   /** Execute a prepared statement with TYPED parameters. */
