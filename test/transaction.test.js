@@ -514,6 +514,49 @@ test('transaction: the opening statement re-dials a connection lost while the cl
   });
 });
 
+test('transaction: a connection that breaks inside a transaction closes its socket at once, not at the next statement or at end()', async () => {
+  // A frame that cannot be placed (a protocol desync) and the one client-side
+  // timeout the driver has, the pool's bound on its own statements: each marks
+  // the connection broken, and the server must see the socket close then — it
+  // keeps the session, its open transaction and its row claims until it does.
+  const rec = recorder();
+  const handle = (req, conn) => {
+    if (req.op === 5) return Buffer.from([9]);                         // no such response tag
+    if (req.op === 1 && req.sql === 'SELECT stall') { rec.handle(req, conn); return []; }   // never answered
+    return rec.handle(req, conn);
+  };
+  const srv = await new FakeServer({ handle }).start();
+  const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret', connectTimeout: 60 });
+  try {
+    for (const breakIt of [
+      (tx) => collect(tx.stream('SELECT odd')),
+      (tx) => pool._bounded(tx, tx.query('SELECT stall')),
+    ]) {
+      const c = await pool.acquire();
+      rec.seen.length = 0;
+      let broke;
+      const out = await c.transaction(async (tx) => {
+        await tx.query('UPDATE a SET v = 1');
+        assert.equal(srv.sockets.size, 1);
+        broke = await breakIt(tx).catch((e) => e);
+        assert.equal(tx.isUsable(), false);
+        // Still inside the body, nothing else called on the client: the socket is closed already.
+        await until(() => srv.sockets.size === 0);
+        return 'the body returned';
+      }).catch((e) => e);
+      assert.ok(isTransport(broke), String(broke));
+      assert.match(broke.message, /unexpected response tag 9|no answer within the connect timeout/);
+      assert.ok(lostInTransaction(out), String(out));
+      assert.ok(!rec.sqls().includes('COMMIT') && !rec.sqls().includes('ROLLBACK'));
+      await pool.release(c);
+    }
+    assert.equal(srv.connections, 2);
+  } finally {
+    await pool.end();
+    await srv.stop();
+  }
+});
+
 // ---- the pool ---------------------------------------------------------------
 
 // Runs `fn(pool, rec, srv)` with a pool over one fake member.
