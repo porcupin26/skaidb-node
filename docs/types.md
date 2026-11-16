@@ -10,13 +10,13 @@ prepares (the normal path), and to `stream()`.
 |---|---|---|
 | Null | `null` | `null`, `undefined` |
 | Bool | `boolean` | `boolean` |
-| Int (64-bit) | `number` when within ±2^53, otherwise `bigint` | `number` with an integer value; any `bigint` that fits 64 bits |
-| Float (64-bit) | `number` | `number` with a fractional value, and `-0` (NaN and ±Infinity are refused) |
+| Int (64-bit) | `number` when within ±2^53, otherwise `bigint` | `number` with an integer value that fits 64 bits; any `bigint` that does |
+| Float (64-bit) | `number` | `number` with a fractional value, `-0`, and an integer value too large for an Int, such as `1e21` (NaN and ±Infinity are refused) |
 | Decimal | `string`, exact (`'123.45'`, `'-0.005'`) | bind a `string`; the driver has no Decimal encoder |
 | String | `string` | `string` |
 | Bytes | `Buffer` | `Buffer` |
 | Uuid | `string`, canonical lowercase `8-4-4-4-12` | bind a `string`; the driver has no Uuid encoder |
-| Timestamp | `Date` (millisecond precision, may predate 1970) | `Date` |
+| Timestamp | `Date` (millisecond precision, may predate 1970) | `Date` (an invalid one is refused: `cannot bind an invalid Date`) |
 | Array | `Array` of mapped values | `Array` (nested values follow this table) |
 | Document | plain object, insertion order kept | plain object (own enumerable keys) |
 
@@ -32,7 +32,9 @@ Notes:
 - A `Buffer` result is a copy; mutating it does not affect the driver.
 - In the client-side fallback (statements the server will not prepare, e.g.
   DDL), values are rendered as SQL literals: `Date` → epoch milliseconds,
-  `Buffer` → hex string, arrays and objects are refused.
+  `Buffer` → hex string, arrays and objects are refused. A `number` is the
+  literal of the value it binds typed: an Int digit for digit, a Float with
+  a `.` or an exponent.
 
 ## TypeScript
 

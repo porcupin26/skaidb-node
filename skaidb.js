@@ -153,17 +153,37 @@ function formatUuid(b) {
 
 // ---- Client-side parameter binding (§5, pg-style $1, $2 ...) ---------------
 
+/**
+ * Whether a number travels as an Int: integer-valued and within 64 bits.
+ * -0 does not (Int has no negative zero), nor does an integer-valued number
+ * past the range — 2^63, 1e21 — which is the Float it always was.
+ */
+function fitsInt64(n) {
+  return Number.isInteger(n) && !Object.is(n, -0) && n >= -(2 ** 63) && n < 2 ** 63;
+}
+
 function quote(arg) {
   if (arg === null || arg === undefined) return 'NULL';
   switch (typeof arg) {
     case 'boolean': return arg ? 'TRUE' : 'FALSE';
-    case 'number':
+    case 'number': {
       if (!Number.isFinite(arg)) throw new SkaidbError('cannot bind NaN/Infinity');
-      return String(arg);
+      // The literal the server reads as the value encodeInto() binds. An
+      // Int digit for digit: past 2^53 the shortest text that reads back as
+      // the same float names another integer. Anything else as a Float,
+      // which to the server is a literal with a `.` or an exponent.
+      if (fitsInt64(arg)) return BigInt(arg).toString();
+      if (Object.is(arg, -0)) return '-0.0';
+      const s = String(arg);
+      return /[.e]/.test(s) ? s : s + '.0';
+    }
     case 'bigint': return arg.toString();
     case 'string': return "'" + arg.replace(/'/g, "''") + "'";
   }
-  if (arg instanceof Date) return String(arg.getTime());
+  if (arg instanceof Date) {
+    if (Number.isNaN(arg.getTime())) throw new SkaidbError('cannot bind an invalid Date');
+    return String(arg.getTime());
+  }
   if (Buffer.isBuffer(arg)) return "'" + arg.toString('hex') + "'";
   throw new SkaidbError(`cannot bind value of type ${typeof arg}`);
 }
@@ -241,8 +261,9 @@ function encodeInto(v, parts) {
   }
   if (typeof v === 'number') {
     // -0 is an integer to JS but has no Int form: binding it as Int 0
-    // would lose the sign, so it travels as the Float it is.
-    if (Number.isInteger(v) && !Object.is(v, -0)) {
+    // would lose the sign, so it travels as the Float it is. So does an
+    // integer-valued number no Int can hold.
+    if (fitsInt64(v)) {
       const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(v), 0);
       parts.push(Buffer.from([2]), b); return;
     }
@@ -258,6 +279,7 @@ function encodeInto(v, parts) {
     parts.push(Buffer.from([6]), u32le(v.length), v); return;
   }
   if (v instanceof Date) {
+    if (Number.isNaN(v.getTime())) throw new SkaidbError('cannot bind an invalid Date');
     const b = Buffer.alloc(8); b.writeBigInt64LE(BigInt(v.getTime()), 0);
     parts.push(Buffer.from([8]), b); return;
   }

@@ -21,6 +21,19 @@ test('quote renders every literal form', () => {
   assert.throws(() => I.quote({ a: 1 }), /cannot bind value of type object/);
 });
 
+test('quote renders a number as the value the typed path binds', () => {
+  // An integer-valued number is that integer digit for digit, not the
+  // shortest text that reads back as the same float (…775000 here).
+  assert.equal(I.quote(2 ** 63 - 1024), '9223372036854774784');
+  assert.equal(I.quote(-(2 ** 63)), '-9223372036854775808');
+  assert.equal(I.quote(2 ** 53), '9007199254740992');
+  assert.equal(I.quote(-7), '-7');
+  // Too large for an Int: a Float in both paths.
+  assert.equal(I.quote(1e21), '1e+21');
+  assert.equal(I.quote(2 ** 63), '9223372036854776000.0');
+  assert.throws(() => I.quote(new Date(NaN)), (e) => e instanceof SkaidbError && e.message === 'cannot bind an invalid Date');
+});
+
 test('bindParams substitutes $N and is the injection boundary', () => {
   assert.equal(I.bindParams('SELECT 1', undefined), 'SELECT 1');
   assert.equal(I.bindParams('SELECT 1', []), 'SELECT 1');

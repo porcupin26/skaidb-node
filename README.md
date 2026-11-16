@@ -554,8 +554,8 @@ running on this connection`, `attempts must be >= 1`.
 |---|---|---|
 | Null | `null` | `null`, `undefined` |
 | Bool | `boolean` | `boolean` |
-| Int (i64) | `number`, or `bigint` when outside ±2^53 | integer `number`, `bigint` |
-| Float | `number` | non-integer `number`, and `-0` (NaN/Infinity refused) |
+| Int (i64) | `number`, or `bigint` when outside ±2^53 | integer `number` within 64 bits, `bigint` |
+| Float | `number` | non-integer `number`, `-0`, and an integer too large for an Int (NaN/Infinity refused) |
 | Decimal | `string` (exact, e.g. `'123.45'`) | bind as `string` |
 | String | `string` | `string` |
 | Bytes | `Buffer` | `Buffer` |
@@ -564,8 +564,9 @@ running on this connection`, `attempts must be >= 1`.
 | Array | `Array` | `Array` (nested) |
 | Document | plain object, key order preserved | plain object |
 
-An integer-valued `number` binds as Int and a fractional one as Float; pass a
-`bigint` to force Int. In the client-side fallback (unpreparable statements)
+An integer-valued `number` binds as Int (as Float when it is too large for
+one, such as `1e21`) and a fractional one as Float; pass a `bigint` to force
+Int. In the client-side fallback (unpreparable statements)
 a `Date` renders as its epoch milliseconds, a `Buffer` as a hex string, and
 arrays/objects cannot be bound at all.
 

@@ -50,6 +50,22 @@ test('NaN and Infinity are refused', () => {
   assert.throws(() => I.encodeValue(-(1n << 63n) - 1n), SkaidbError);
 });
 
+test('a number too large for a 64-bit integer binds as the Float it is; an invalid Date is refused', () => {
+  // Integer-valued to JS, but no Int can hold them.
+  for (const v of [2 ** 63, 1e21, -1e300, Number.MAX_VALUE, -(2 ** 63) - 2048]) {
+    assert.equal(I.encodeValue(v)[0], 3, String(v));
+    assert.equal(roundtrip(v), v);
+  }
+  // Up to the ends of the range a number is the Int it says, exactly.
+  assert.equal(I.encodeValue(-(2 ** 63))[0], 2);
+  assert.equal(roundtrip(-(2 ** 63)), -(2n ** 63n));
+  assert.equal(I.encodeValue(2 ** 63 - 1024)[0], 2);
+  assert.equal(roundtrip(2 ** 63 - 1024), 2n ** 63n - 1024n);
+  const invalid = (e) => e instanceof SkaidbError && e.message === 'cannot bind an invalid Date';
+  assert.throws(() => I.encodeValue(new Date(NaN)), invalid);
+  assert.throws(() => I.encodeValue([{ at: new Date('not a date') }]), invalid);
+});
+
 test('string (UTF-8), bytes (Buffer), timestamp (Date, ms)', () => {
   assert.equal(roundtrip('héllo — wörld 🚀'), 'héllo — wörld 🚀');
   assert.equal(roundtrip(''), '');
