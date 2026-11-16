@@ -467,7 +467,7 @@ checked out: a burst opens extras and the surplus is closed on release.
 `acquire()` validates an idle connection before handing it out and discards
 one the server closed meanwhile; `release()` closes a broken connection
 instead of pooling it, and likewise one that a `transaction()` may still be
-open on. Every `Client` option passes through; `seeds` (or `host`/`port`)
+open on, or that a stream left open still holds. Every `Client` option passes through; `seeds` (or `host`/`port`)
 name the starting members. `pool.transaction()` runs a
 [transaction](#transactions) on one checked-out connection.
 

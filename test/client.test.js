@@ -1441,6 +1441,38 @@ test('Pool reuses idle connections, bounds the idle set, and discards broken one
   });
 });
 
+test('Pool: a connection released with a stream still open on it is closed, not handed to the next borrower', async () => {
+  const handle = (req) => (req.op === 5 ? [F.header(['id']), F.chunk([[1], [2]]), F.chunk([[3]]), F.end()]
+    : req.op === 1 ? F.rows(['v'], [[1]]) : undefined);
+  await withServer({ handle }, async (srv) => {
+    const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret', maxsize: 1 });
+    try {
+      // The stream holds the connection until it is finished or closed, and
+      // nobody is going to do either: pooled, the next borrower's statements
+      // would wait behind it for good.
+      const busy = await pool.acquire();
+      const it = busy.stream('SELECT id FROM big');
+      assert.deepEqual((await it.next()).value, { id: 1 });         // one row read, never closed
+      await settles(pool.release(busy));
+      assert.equal(pool.members()[0].idle, 0);
+      assert.equal(busy.isUsable(), false);
+      assert.deepEqual((await settles(pool.withConnection((c) => c.query('SELECT 1')))).rows, [{ v: 1 }]);
+      assert.equal(srv.connections, 2);
+      // A stream that was finished, or closed early, holds nothing: pooled as ever.
+      const tidy = await pool.acquire();
+      assert.equal((await collect(tidy.stream('SELECT id FROM big'))).length, 3);
+      for await (const row of tidy.stream('SELECT id FROM big')) { assert.equal(row.id, 1); break; }
+      await pool.release(tidy);
+      assert.equal(pool.members()[0].idle, 1);
+      assert.equal(await pool.acquire(), tidy);
+      await pool.release(tidy);
+      assert.equal(srv.connections, 2);
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
 // Stream log ids as the server really issues them: opaque strings that sort
 // in log order. A driver that treated them as numbers (`after: 0`) would ask
 // for `id > 0`, which no such id satisfies.

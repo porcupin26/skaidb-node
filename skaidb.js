@@ -2185,14 +2185,15 @@ class Pool extends EventEmitter {
     // clean-up ROLLBACK did not go through: the transaction may still be
     // open on the connection, and the next caller must not inherit it.
     const settled = conn._txn === null && !conn._txnRollbackFailed;
+    // A stream the borrower left open holds the connection until it is
+    // finished or closed, which may be never: pooled, the next borrower's
+    // statements would wait behind it. Such a connection is closed too.
     const keep = () => !this.closed && settled && conn.isUsable() && m && this._usable(m)
-      && this._idle.length < this.maxsize;
+      && this._idle.length < this.maxsize && conn._streams.size === 0;
     // The borrower entered another database with USE: the next borrower
     // gets the pool's own. If that cannot be entered again the connection
     // is not pooled.
-    // Not behind a stream the borrower left open, though: that USE would
-    // wait for a stream nobody is going to close.
-    if (keep() && this._database !== null && conn.database !== this._database && conn._streams.size === 0) {
+    if (keep() && this._database !== null && conn.database !== this._database) {
       await this._bounded(conn, conn.query(useStatement(this._database))).catch(() => {});
     }
     if (keep() && (this._database === null || conn.database === this._database)) {
