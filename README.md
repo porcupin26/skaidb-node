@@ -153,6 +153,14 @@ for await (const row of client.stream('SELECT ...', { consistency: 'ONE' })) { .
 `batch(sql, rows, { consistency })` takes it per batch too. The `CONSISTENCY` export holds the
 numeric constants (`{ ONE: 0, QUORUM: 1, ALL: 2 }`).
 
+`SET CONSISTENCY { ONE | QUORUM | ALL }` sent as a statement is something
+else: an override on the connection, under which every statement runs at
+that level whatever level it was sent with, until `SET CONSISTENCY DEFAULT`
+clears it (server ≥ 0.349). Like a `SET SCAN BUDGET …`, it is state of the
+session: the client gives both to a connection it [re-dials](#reconnect-and-errors),
+and a [pool](#pooling--new-pooloptions) takes both off a connection before
+the next borrower gets it.
+
 ## Queries
 
 ### `client.query(text, values?)` / `client.query({ text, values, consistency, rowMode })`
