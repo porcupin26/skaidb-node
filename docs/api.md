@@ -308,7 +308,7 @@ alert) the message is `connection lost: <that error's message>` — for
 example `connection lost: read ECONNRESET` — and the socket's error is the
 `SkaidbError`'s `cause`.
 The next `query()`, `batch()` or `stream()` first re-dials — the full seed
-walk, handshake, Hello and `USE` — then runs (except while a
+walk, handshake, Hello, `USE` and the session's settings — then runs (except while a
 [`transaction()`](#clienttransactionbody-opts-promiset) is open, which
 fails instead). The prepared-statement cache
 is cleared. The driver never re-runs the failed statement: it may have
@@ -327,6 +327,19 @@ trailing `;`; text the client cannot read as exactly that is left alone, and
 the new connection, the statement rejects with the server's error for the
 `USE` (`database "app" does not exist`), a statement error like any other,
 and is not sent: it never runs in another database.
+
+So do the session's settings. `SET CONSISTENCY { ONE | QUORUM | ALL }` (an
+override for every statement on the connection) and `SET SCAN BUDGET ROWS
+<n> [BYTES <n>]` are state of the connection too, and a new one has
+neither. The client notes the last statement of each kind the server
+accepted — sent through `query()` or `stream()` as one statement of its
+own, any case, an optional trailing `;`, `--` comments allowed — and sends
+it again on a new connection, after the `USE` and before the statement:
+first the `SET CONSISTENCY`, then the `SET SCAN BUDGET`. `SET … DEFAULT`
+clears the note, so a setting that was cleared is not sent again. If the
+server refuses one of them on the new connection the statement rejects
+with that error and is not sent: it never runs at another consistency or
+without the limit the application set.
 
 ## `new Pool(options?)`
 

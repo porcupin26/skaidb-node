@@ -246,9 +246,10 @@ export class Client {
 
   /**
    * Dial the seeds in shuffled order until one connects and authenticates,
-   * then send Hello and `USE <database>` if one was given. Until it has
-   * resolved, every statement rejects with `not connected: await connect()
-   * first`.
+   * then send Hello, `USE <database>` if the client is in one, and the
+   * `SET CONSISTENCY` / `SET SCAN BUDGET` it was last sent as statements.
+   * Until it has resolved, every statement rejects with `not connected:
+   * await connect() first`.
    */
   connect(): Promise<void>;
 

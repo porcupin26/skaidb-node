@@ -403,6 +403,69 @@ function usedDatabase(sql) {
   return words[words.length - 1];
 }
 
+// ---- the session's settings ---------------------------------------------------
+
+/**
+ * `sql` without its `--` comments (each runs to the end of its line), a `--`
+ * inside a double-quoted name or a single-quoted string left alone.
+ */
+function withoutLineComments(sql) {
+  let out = '';
+  let quote = null;
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    if (quote !== null) {
+      out += ch;
+      if (ch === quote) quote = null;
+    } else if (ch === '-' && sql[i + 1] === '-') {
+      const eol = sql.indexOf('\n', i);
+      if (eol < 0) break;
+      out += '\n';
+      i = eol;
+    } else {
+      out += ch;
+      if (ch === '"' || ch === "'") quote = ch;
+    }
+  }
+  return out;
+}
+
+/**
+ * The words of `sql` when it is exactly one statement: its comments and an
+ * optional trailing `;` gone, split at whitespace. null when there is no
+ * statement, or a `;` is left — more than one statement, which the server
+ * refuses anyway.
+ */
+function statementWords(sql) {
+  if (typeof sql !== 'string') return null;
+  let text = withoutLineComments(sql).trim();
+  if (text.endsWith(';')) text = text.slice(0, -1).trimEnd();
+  if (text === '' || text.includes(';')) return null;
+  return text.split(/\s+/u);
+}
+
+/**
+ * The session setting `sql` makes when it is exactly one `SET CONSISTENCY …`
+ * or `SET SCAN BUDGET …` statement, as {kind, text}: `kind` is
+ * `'consistency'` or `'scanBudget'` and `text` the statement to send again
+ * on a new connection — as written, comments gone — or null when its next
+ * word is DEFAULT, which clears the setting. null for anything else, which
+ * is left alone. The statement is not read any further: what it sets is the
+ * server's business, and only one the server accepted is kept.
+ */
+function sessionSetting(sql) {
+  const words = statementWords(sql);
+  if (words === null) return null;
+  const word = (i) => (i < words.length ? words[i].toLowerCase() : '');
+  if (word(0) !== 'set') return null;
+  let kind;
+  let next;
+  if (word(1) === 'consistency') { kind = 'consistency'; next = 2; }
+  else if (word(1) === 'scan' && word(2) === 'budget') { kind = 'scanBudget'; next = 3; }
+  else return null;
+  return { kind, text: word(next) === 'default' ? null : words.join(' ') };
+}
+
 // ---- result decoding (§3.2) -------------------------------------------------
 
 /** A Rows body, also one set of ResultSets; `r` sits just past the tag. */
@@ -495,8 +558,14 @@ class Client {
     this.tlsServerName = opts.tlsServerName || 'skaidb';
     // Session database, selected with USE right after the handshake — on
     // every dial, so it is also where a re-dialled connection goes back to.
-    // A USE statement the server accepted moves it (see _noteUse).
+    // A USE statement the server accepted moves it (see _noteSession).
     this.database = opts.database || null;
+    // The session's settings, each as the statement that made it — the last
+    // `SET CONSISTENCY …` and the last `SET SCAN BUDGET …` the server
+    // accepted, null when there is none or it was cleared with DEFAULT. They
+    // live on the connection, so a new one is given them again, after the
+    // database and before anything else is sent.
+    this._settings = { consistency: null, scanBudget: null };
     this._sock = null;
     this._buf = Buffer.alloc(0);
     this._waiters = [];       // queue of {resolve, reject} awaiting a frame
@@ -693,17 +762,9 @@ class Client {
         sock.on('data', (d) => { if (this._sock === sock) this._onData(d); });
         sock.on('error', (e) => { if (this._sock === sock) this._fail(e); });
         sock.on('close', () => { if (this._sock === sock) this._fail(new SkaidbError('connection closed')); });
-        // USE goes straight to the socket, not through query(): a reconnect
-        // runs INSIDE the statement that triggered it, and query() would
-        // queue the USE behind that very statement — a deadlock that hung
-        // every client with a session database on its first statement
-        // after a lost connection.
         this._handshake()
           .then(() => this._sendHello())
-          .then(() => this.database
-            ? this._doQuery(useStatement(this.database), this.consistency, 'object')
-                .then(() => undefined)
-            : undefined)
+          .then(() => this._enterSession())
           .then((v) => { clearTimeout(to); resolve(v); }, (e) => {
             clearTimeout(to);
             // A seed that fails the handshake (denied, a bad signature, a
@@ -721,6 +782,27 @@ class Client {
           });
       });
     });
+  }
+
+  /**
+   * Put a connection that has just logged in into the client's session: its
+   * database, then the consistency override and the scan budget the
+   * application set with statements of its own. A new connection has none
+   * of them, and the statement that comes next must not run in another
+   * database, at another consistency or without the limit it was given: if
+   * the server refuses one of these, that error fails the dial, and with it
+   * the statement.
+   *
+   * They go straight to the socket, not through query(): a reconnect runs
+   * INSIDE the statement that triggered it, and query() would queue them
+   * behind that very statement — a deadlock that hung every client with a
+   * session database on its first statement after a lost connection.
+   */
+  async _enterSession() {
+    const send = (sql) => this._doQuery(sql, this.consistency, 'object');
+    if (this.database) await send(useStatement(this.database));
+    if (this._settings.consistency !== null) await send(this._settings.consistency);
+    if (this._settings.scanBudget !== null) await send(this._settings.scanBudget);
   }
 
   _onData(d) {
@@ -892,14 +974,19 @@ class Client {
   }
 
   /**
-   * The server accepted `sql`, sent as text: when it is a USE statement the
-   * session is in another database now, and that is the one to re-enter
-   * after a re-dial — a new connection starts in the default database, where
-   * the next statement would find another table of the same name.
+   * The server accepted `sql`, sent as text: note what it did to the
+   * session, which a re-dialled connection has to be given again. A USE
+   * statement moved it to another database — a new connection starts in the
+   * default one, where the next statement would find another table of the
+   * same name. A SET CONSISTENCY or SET SCAN BUDGET statement is the
+   * setting of its kind from now on, or clears it (DEFAULT) — a new
+   * connection reads at the request's own level, with no limit on a scan.
    */
-  _noteUse(sql) {
+  _noteSession(sql) {
     const name = usedDatabase(sql);
-    if (name !== null) this.database = name;
+    if (name !== null) { this.database = name; return; }
+    const setting = sessionSetting(sql);
+    if (setting !== null) this._settings[setting.kind] = setting.text;
   }
 
   /** A statement succeeded: a pool with read-your-writes remembers which member took a write. */
@@ -979,7 +1066,7 @@ class Client {
       }
       const sent = bindParams(text, params);
       const res = await this._doQuery(sent, consistency, rowMode);
-      if (res.command === 'DDL') this._noteUse(sent);
+      if (res.command === 'DDL') this._noteSession(sent);
       return res;
     }).then((res) => {
       this._noteStatement(text);
@@ -1104,7 +1191,7 @@ class Client {
       }
       if (tag === 2) {
         this.stream.command = 'DDL';
-        if (request[0] === 5) this._noteUse(sql);          // sent as text, exactly as given
+        if (request[0] === 5) this._noteSession(sql);      // sent as text, exactly as given
         return;
       }
       if (tag === 8) {
@@ -2337,7 +2424,7 @@ module.exports = { Client, Pool, SkaidbError, TransactionConflictError, CONSISTE
 // for the driver's own unit tests. Not part of the supported API: anything
 // under `_internal` may change between minor versions without notice.
 module.exports._internal = {
-  Reader, decodeValue, encodeValue, bindParams, toQmark, quote, usedDatabase,
+  Reader, decodeValue, encodeValue, bindParams, toQmark, quote, usedDatabase, sessionSetting,
   decimalToString, formatUuid, encStr, u32le, resolveConsistency,
   DRAIN_BUDGET_BYTES, AUTH_MECHANISM, authStartFrame, parseAuthOutcome, scramProof,
   parseEndpoint, isWrite, memberFault,
