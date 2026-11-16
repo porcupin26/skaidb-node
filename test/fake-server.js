@@ -4,6 +4,7 @@
 // whatever the test scripts. No skaidb binary is involved.
 
 const net = require('net');
+const dns = require('dns');
 const crypto = require('crypto');
 const { _internal: I } = require('../skaidb');
 
@@ -97,7 +98,7 @@ class FakeServer {
    *                  called for every post-handshake request; Hello is
    *                  answered with Ddl unless the handler returns something.
    * opts.host      — address to listen on (default '127.0.0.1'); 'localhost'
-   *                  binds whichever family a client's lookup tries first
+   *                  binds the address a client's lookup of it gets
    * opts.allowHalfOpen — true: a connection stays open for reading after its
    *                  sending side was ended (`sock.end()`), so a test can
    *                  half-close one and see what still arrives on it
@@ -120,7 +121,14 @@ class FakeServer {
   start() {
     return new Promise((resolve) => {
       this.server = net.createServer({ allowHalfOpen: this.allowHalfOpen }, (sock) => this._onConnection(sock));
-      this.server.listen(0, this.host, () => { this.port = this.server.address().port; resolve(this); });
+      // A name is resolved here as a client's connect resolves it — with
+      // ADDRCONFIG, which leaves out a family the machine has no address
+      // in — and not as listen() would: where `localhost` is both ::1 and
+      // 127.0.0.1 but only IPv4 is configured (a container on a bridge
+      // network), listen() binds ::1 and every client dials 127.0.0.1.
+      dns.lookup(this.host, { hints: dns.ADDRCONFIG }, (err, address) => {
+        this.server.listen(0, err ? this.host : address, () => { this.port = this.server.address().port; resolve(this); });
+      });
     });
   }
 
