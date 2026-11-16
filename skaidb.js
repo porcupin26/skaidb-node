@@ -1364,7 +1364,9 @@ class Client {
     if (this._pool !== null && this._poolOut) this._pool._closedOut(this);
     return new Promise((resolve) => {
       if (!this._sock) return resolve();
-      this._sock.end(resolve);
+      // The callback's argument is dropped: on a socket that was ended
+      // before it is an "already finished" error, which is not a result.
+      this._sock.end(() => resolve());
     });
   }
 }

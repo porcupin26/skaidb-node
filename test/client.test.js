@@ -827,6 +827,18 @@ test('a closed client rejects every statement with "connection is closed", a clo
   });
 });
 
+test('end() resolves to nothing, the first time and when it is called again', async () => {
+  await withServer({}, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    assert.equal(await c.end(), undefined);
+    assert.equal(await c.end(), undefined);                    // not the socket's "already finished" error
+    await until(() => srv.sockets.size === 0);
+    const never = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    assert.equal(await never.end(), undefined);
+  });
+});
+
 test('Pool reuses idle connections, bounds the idle set, and discards broken ones', async () => {
   await withServer({ handle: (req) => (req.op === 1 ? F.rows(['v'], [[1]]) : F.ddl()) }, async (srv) => {
     const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret', maxsize: 1 });
