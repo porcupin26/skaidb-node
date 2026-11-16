@@ -548,8 +548,8 @@ Every error the driver raises is a `SkaidbError` (an `Error` subclass).
   and the next statement reconnects.
 - `end()` is terminal: a closed client never reconnects (`connection is closed`).
 - A client that has not connected dials nothing on its own: until
-  `connect()` has resolved, a statement rejects with `not connected: await
-  connect() first`.
+  `connect()` has resolved — and after one that failed, however it failed —
+  a statement rejects with `not connected: await connect() first`.
 
 Common messages: `connect failed: …`, `connect timeout`, `no reachable
 endpoint in …`, `authentication denied: …`, `server signature mismatch

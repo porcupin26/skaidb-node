@@ -1283,6 +1283,29 @@ test('a client that is not connected rejects every statement with a SkaidbError 
     await rejectsEverywhere(unreachable, NOT_CONNECTED, 'connect() refused');
     await unreachable.end();
   });
+  // … and a peer that hangs up in the middle of the handshake. However a
+  // connect() failed, the client is not connected: no later statement dials
+  // by itself, as one does on a client whose connection was lost.
+  await withServer({ handle: (req) => (req.op === 1 ? F.rows(['v'], [[1]]) : undefined) }, async (srv) => {
+    for (let i = 0; i < 5; i++) {
+      srv.refuse = true;                                      // accepts TCP, then hangs up
+      const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+      await assert.rejects(c.connect(), /no reachable endpoint/);
+      assert.equal(c.isUsable(), false);
+      srv.refuse = false;
+      await rejectsEverywhere(c, NOT_CONNECTED, 'connect() hung up on');
+      assert.equal(srv.connections, i);                       // nothing was dialled for them
+      // The same for a client that had a connection before: a connect() by
+      // hand that fails leaves it not connected, too.
+      await c.connect();
+      srv.refuse = true;
+      await assert.rejects(c.connect(), /no reachable endpoint/);
+      srv.refuse = false;
+      await rejectsEverywhere(c, NOT_CONNECTED, 'connect() again, hung up on');
+      assert.equal(srv.connections, i + 1);
+      await c.end();
+    }
+  });
   // A handshake that has not finished: the socket is there, the connection
   // is not. A statement must not be written into the middle of the handshake.
   const frames = [];

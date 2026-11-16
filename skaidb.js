@@ -573,6 +573,13 @@ class Client {
         if (this._pool !== null && memberFault(e)) this._pool._failed(`${seed.host}:${seed.port}`);
       }
     }
+    // However the last attempt failed — refused, denied, timed out, or hung
+    // up on mid-handshake, which marks the client broken — a dial that
+    // failed leaves the client not connected: nothing is dialled outside
+    // connect(), so a statement must not take "broken" for a connection
+    // that was lost and dial by itself. (A statement's own re-dial that
+    // fails says so itself and is tried again by the next one.)
+    this._broken = false;
     throw new SkaidbError(
       `no reachable endpoint in ${order.map((s) => `${s.host}:${s.port}`).join(', ')}: ${last && last.message}`);
   }

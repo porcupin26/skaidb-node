@@ -32,10 +32,10 @@ The constructor only stores the configuration; nothing is dialled until
 `tlsClientCert` without `tlsClientKey` (or the reverse), and
 `authMechanism: 'certificate'` without a client certificate.
 
-A statement on a client that has not connected — `connect()` not called, or
-not resolved yet — rejects with `SkaidbError('not connected: await connect()
-first')` and sends nothing; so does `transaction()`, whose body does not
-run.
+A statement on a client that has not connected — `connect()` not called,
+not resolved yet, or failed, in whichever way — rejects with
+`SkaidbError('not connected: await connect() first')` and sends nothing; so
+does `transaction()`, whose body does not run.
 
 Public fields after construction: `host`, `port` (the endpoint most recently
 dialled), `seeds` (parsed to `{ host, port }`), `user`, `password`,
