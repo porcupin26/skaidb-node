@@ -16,7 +16,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { Worker } = require('worker_threads');
 const { Client, Pool, SkaidbError } = require('../skaidb');
-const { FakeServer, F } = require('./fake-server');
+const { FakeServer, F, frame } = require('./fake-server');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const collect = async (it) => { const rows = []; for await (const r of it) rows.push(r); return rows; };
@@ -255,6 +255,54 @@ test('inside transaction() a close that arrived while the event loop was busy is
       assert.deepEqual(await p.report(), { connections: 1, late: 0, lateRequests: 0 }, how);
       await c.end();
     });
+  }
+});
+
+// ---- data nobody asked for ---------------------------------------------------
+
+const until = async (pred, ms = 2000) => {
+  const t0 = Date.now();
+  while (!pred()) {
+    if (Date.now() - t0 > ms) throw new Error('timeout waiting');
+    await sleep(5);
+  }
+};
+
+test('data the server sent on an idle connection is not read as the next statement\'s answer: the connection is replaced', async () => {
+  const handle = (req) => (req.op === 1 ? F.rows(['answer_to'], [[req.sql]]) : undefined);
+  const srv = await new FakeServer({ handle }).start();
+  try {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    assert.deepEqual((await c.query('SELECT 1')).rows, [{ answer_to: 'SELECT 1' }]);
+    // A whole frame, and then a part of one: either way the stream is no
+    // longer at a request boundary, and whatever is read next is not the
+    // answer to what is sent next.
+    for (const [i, stray] of [frame(F.error('server is shutting down')), frame(F.ddl()).subarray(0, 3)].entries()) {
+      [...srv.sockets][0].write(stray);
+      await sleep(50);
+      assert.deepEqual((await settles(c.query('SELECT 2'))).rows, [{ answer_to: 'SELECT 2' }]);
+      assert.deepEqual((await settles(c.query('SELECT 3'))).rows, [{ answer_to: 'SELECT 3' }]);
+      assert.equal(srv.connections, i + 2);
+      await until(() => srv.sockets.size === 1);            // the one it gave up on was closed
+    }
+    await c.end();
+    // A pooled connection with such data waiting is not handed out.
+    const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    try {
+      const idle = await pool.acquire();
+      await pool.release(idle);
+      [...srv.sockets][0].write(frame(F.error('server is shutting down')));
+      await sleep(50);
+      const conn = await pool.acquire();
+      assert.notEqual(conn, idle);
+      assert.deepEqual((await settles(conn.query('SELECT 4'))).rows, [{ answer_to: 'SELECT 4' }]);
+      await pool.release(conn);
+    } finally {
+      await pool.end();
+    }
+  } finally {
+    await srv.stop();
   }
 });
 

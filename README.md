@@ -555,7 +555,8 @@ Every error the driver raises is a `SkaidbError` (an `Error` subclass).
   a millisecond is looked at first, which takes a turn of the event loop
   and no round trip, so a close that arrived while your code kept the
   event loop busy is seen as well.
-- **Protocol desync** (an unexpected frame): the driver drops the connection
+- **Protocol desync** (an unexpected frame, or data waiting on a connection
+  that no statement asked for): the driver drops the connection
   (`isUsable()` → false) rather than hand the next caller a misaligned reply,
   and the next statement reconnects.
 - `end()` is terminal: a closed client never reconnects (`connection is closed`).

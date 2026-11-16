@@ -314,7 +314,10 @@ fails instead). The prepared-statement cache
 is cleared. The driver never re-runs the failed statement: it may have
 executed on the server, and retrying a write could duplicate it. A protocol
 desync (an unexpected frame) is handled the same way: the connection is
-dropped rather than reused misaligned.
+dropped rather than reused misaligned. So is data found waiting on an idle
+connection: between statements a server sends nothing, so those bytes
+answer no request, and the statement goes out on a new connection instead
+of reading them as its reply.
 
 A connection that the server closed while the client was idle — a member
 restart, a failover, an idle timeout — is found out before the next request

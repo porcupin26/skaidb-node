@@ -905,12 +905,23 @@ class Client {
    */
   async _look() {
     if (this._sock === null || this._broken || this._closed) return;
-    if (performance.now() - this._heard < IDLE_LOOK_MS) return;
-    await new Promise(setImmediate);
-    await new Promise(setImmediate);
-    // Alive as of now: the pool's look at checkout and the look of the
-    // statement that follows it are one.
-    if (this._sock !== null && !this._broken) this._heard = performance.now();
+    if (performance.now() - this._heard >= IDLE_LOOK_MS) {
+      await new Promise(setImmediate);
+      await new Promise(setImmediate);
+      if (this._sock === null || this._broken || this._closed) return;
+      // Alive as of now: the pool's look at checkout and the look of the
+      // statement that follows it are one.
+      this._heard = performance.now();
+    }
+    // Between statements a server sends nothing, and every answer has been
+    // read. Bytes waiting here were sent to nobody — and would be read as
+    // the answer to the request that is about to go out, every later
+    // statement then getting the answer of the one before it. Wherever
+    // they came from, the stream is no longer at a request boundary: the
+    // connection is dead, like one the peer closed.
+    if (this._frames.length > 0 || this._buf.length > 0) {
+      this._fail(new SkaidbError('connection lost: the server sent data nobody asked for'));
+    }
   }
 
   /**
