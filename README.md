@@ -28,7 +28,7 @@ npm install @skaidb/client
 
 The package is `@skaidb/client` on the npm registry and is required as
 `@skaidb/client`. To install straight from GitHub instead, pin a tag with
-`npm install github:porcupin26/skaidb-node#v1.5.0` (`#main` follows the
+`npm install github:porcupin26/skaidb-node#v1.5.1` (`#main` follows the
 development branch); the module name is the same whatever the install
 source.
 

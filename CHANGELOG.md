@@ -4,6 +4,105 @@ All notable changes to the skaidb Node.js driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-11-16
+
+### Fixed
+- A connection that had run more than 256 different parameterised
+  statements stopped binding typed values without saying so. The driver
+  caches 240 prepared statements per connection and the server keeps 256;
+  a statement that did not fit the cache was prepared, run and left open,
+  so the 257th was refused (`too many prepared statements`) and the driver
+  answered that as it answers a statement that cannot be prepared, by
+  sending the text with client-side literals. From then on every statement
+  new to that connection stored a `Date` as its epoch milliseconds (a
+  number, not a timestamp) and a `Buffer` as a hex string, rejected arrays
+  and objects with `cannot bind value of type object`, and `batch()`
+  failed with `statement cannot be prepared, so it cannot be batched`. A
+  statement the cache has no room for is now closed on the server once it
+  has run, so the server's limit is never reached.
+- A prepare the server refuses because the connection's statement table
+  is full rejects with the server's message instead of falling back to
+  literals. The fallback is for refusals that are about the statement —
+  DDL, `USE` and other session statements, and servers without prepared
+  statements — and those are unchanged.
+- A statement on a client that is not connected rejects with
+  `SkaidbError('not connected: await connect() first')`. `query()`,
+  `batch()`, `stream()`, `transaction()` and `subscribe()` on a client
+  whose `connect()` was never called, had failed or was still running
+  rejected with a raw `TypeError: Cannot read properties of null (reading
+  'write')`, and one sent while the handshake was in flight was written
+  into the middle of it. Nothing is sent now, and a transaction's body
+  does not run.
+- `transaction()` no longer hangs when its body leaves a stream open. A
+  stream holds its connection until its iterator is finished or closed, so
+  a body that opened one and returned or threw without closing it — taking
+  only the first row with `.next()` is enough — left the `COMMIT` or
+  `ROLLBACK` waiting behind it for good: `transaction()` never settled,
+  the body's error was lost, later statements on the client hung, a pool
+  never got the connection back, and the server kept the transaction
+  open. The client now closes the connection, which makes the server drop
+  the transaction, and `transaction()` rejects — with the body's own error
+  if it threw, otherwise with `the transaction body left a stream open: …`
+  — without a retry. The next statement reconnects; a pool closes that
+  connection instead of pooling it. A stream read to its end or left by a
+  `for await` loop is closed already and changes nothing.
+- A `number` too large for a 64-bit integer — `2 ** 63`, `1e21`,
+  `Number.MAX_VALUE`, all integer-valued to JavaScript — binds as a Float
+  instead of rejecting with Node's `RangeError: The value of "value" is
+  out of range`, and an invalid `Date` rejects with `SkaidbError('cannot
+  bind an invalid Date')` instead of a `RangeError` as well. In the
+  client-side fallback a number is now the literal of the same value: an
+  integer past 2^53 was written as a nearby, different integer, one from
+  2^63 up as a literal the server refuses, and `-0` as `0`.
+- The session database survives a reconnect when it was entered with a
+  `USE` statement. A client re-dials a lost connection on its next
+  statement and a new connection starts in the server's default database;
+  the `database` option was re-entered there, a database entered with
+  `client.query('USE app')` was not, so the next statement ran in the
+  default database (or the option's) against whatever table of the same
+  name is there — refused for a role without rights on it, otherwise
+  reading or writing the wrong table. The client now notes a `USE
+  [DATABASE] <name>` the server accepted (through `query()` or
+  `stream()`, as one statement of its own), keeps it in `client.database`,
+  and enters that database on every dial before anything else is sent. If
+  it cannot be entered on the new connection, the statement fails with the
+  server's error and is not sent.
+- A pool with a `database` option hands every borrower a connection in
+  that database. One whose previous borrower had sent `USE other` came
+  back from the pool still in `other`; `release()` now puts it back into
+  the pool's database first, and closes it if that cannot be done. A pool
+  without a `database` option leaves a connection where its borrower left
+  it, as before.
+- `connect()` called again on a client empties its prepared-statement
+  cache, as the client's own re-dial of a lost connection always did. An
+  application that reconnects by hand kept the ids of the old connection,
+  and an id is only an index on the connection that issued it: on the new
+  one a cached statement failed with `unknown prepared statement id N` or,
+  once another statement had taken that number there, ran as that
+  statement with its own values — an `UPDATE` executed as the `DELETE`
+  holding its old id. Every dial now starts with an empty cache, and a
+  cached id is used, and closed, only on the connection that issued it.
+- `connectTimeout` bounds the whole connect, the login handshake included.
+  It covered only the TCP connect and TLS, so a peer that accepts the
+  connection and then says nothing held `connect()` — and a statement
+  re-dialling a lost connection — for good, and the next seed was never
+  tried. Such a seed now fails with `connect timeout` and the walk goes
+  on. The timer also ends with the attempt: a script whose `connect()`
+  was refused at once no longer stays alive for the rest of
+  `connectTimeout`.
+- `client.end()` rejects the statements waiting behind a stream that is
+  still open, and every statement sent afterwards, with `connection is
+  closed`. They waited for good: an open stream holds the client's
+  statement queue, and `end()` did not let it go.
+- A connection that ends with a socket error instead of a clean close — a
+  reset, a broken pipe, a TLS alert — rejects the statement in flight with
+  a `SkaidbError`, `connection lost: read ECONNRESET` and the like, whose
+  `cause` is the socket's error. It rejected with Node's own `Error`, so
+  `instanceof SkaidbError` did not see a lost connection there.
+- `client.end()` resolves to `undefined` however often it is called. It
+  resolved to `null`, and on a client that was already ended to the
+  socket's `ERR_STREAM_ALREADY_FINISHED` error object.
+
 ## [1.5.0] - 2026-11-15
 
 ### Added
