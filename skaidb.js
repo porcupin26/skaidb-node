@@ -1449,6 +1449,12 @@ class Client {
     // Closed while checked out instead of released: the pool stops counting
     // it against its member.
     if (this._pool !== null && this._poolOut) this._pool._closedOut(this);
+    // A stream that is still open holds the statement queue until it is
+    // finished or closed, which may be never: let the queue go, so that
+    // what waits behind it, and whatever comes later, is told the
+    // connection is closed instead of waiting. The stream keeps reading
+    // what the server sends it.
+    for (const s of this._streams) s.release();
     return new Promise((resolve) => {
       if (!this._sock) return resolve();
       // The callback's argument is dropped: on a socket that was ended

@@ -739,6 +739,28 @@ test('connectTimeout bounds the handshake too: a peer that accepts the connectio
   }
 });
 
+test('end() lets go of a connection a stream still holds: later statements reject instead of waiting behind it', async () => {
+  const handle = (req) => (req.op === 5 ? [F.header(['id']), F.chunk([[1], [2]]), F.chunk([[3]]), F.end()] : F.rows(['v'], [[1]]));
+  await withServer({ handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const it = c.stream('SELECT id FROM big');
+    assert.deepEqual((await it.next()).value, { id: 1 });
+    const queued = c.query('SELECT 1');                        // waits behind the open stream
+    queued.catch(() => {});
+    await settles(c.end());
+    const closed = (e) => e instanceof SkaidbError && e.message === 'connection is closed';
+    await assert.rejects(settles(queued), closed);             // … and was never sent
+    await assert.rejects(settles(c.query('SELECT 1')), closed);
+    await assert.rejects(settles(c.batch('INSERT INTO t (id) VALUES ($1)', [[1]])), closed);
+    await assert.rejects(settles(collect(c.stream('SELECT 1'))), closed);
+    await assert.rejects(settles(c.transaction(async () => {})), closed);
+    assert.equal(srv.requests.filter((q) => q.op === 1).length, 0);
+    // The stream itself is not cut short by end(): what the server had sent is still read.
+    assert.deepEqual(await settles(collect(it)), [{ id: 2 }, { id: 3 }]);
+  });
+});
+
 test('seeds: a dead endpoint is skipped, a live one wins', async () => {
   const dead = net.createServer();
   await new Promise((r) => dead.listen(0, '127.0.0.1', r));

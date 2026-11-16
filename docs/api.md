@@ -249,7 +249,8 @@ The connection is busy for the whole stream. Closing the iterator frees it:
    statement re-dials transparently.
 
 An iterator that is dropped half-read without being closed keeps the
-connection busy forever, and every statement queued behind it hangs.
+connection busy, and every statement queued behind it waits — until the
+client is ended, when they reject with `connection is closed`.
 JavaScript offers no finalizer to rescue this. Always consume or close.
 
 ### `client.subscribe(name, opts?)` → `AsyncGenerator<StreamEvent>`
@@ -283,7 +284,8 @@ the socket (until the next statement reconnects it).
 ### `client.end(): Promise<void>`
 
 Closes the connection. Terminal: any later statement rejects with
-`connection is closed`.
+`connection is closed` — also one that was waiting behind a stream that is
+still open on the client, which no longer holds the others up.
 
 ### Reconnect
 

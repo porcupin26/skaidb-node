@@ -379,8 +379,9 @@ boundary; past that it drops the connection instead, and the next statement
 transparently reconnects. Either way the next statement reads its own reply.
 
 An iterator that is merely dropped half-read is closed by nobody — JavaScript
-has no finalizer that could do it — and that connection stays busy for good,
-with every queued statement behind it. Always iterate to the end or close it.
+has no finalizer that could do it — and that connection stays busy, with
+every queued statement behind it, until the client is ended (`end()` rejects
+them with `connection is closed`). Always iterate to the end or close it.
 
 ```js
 const it = client.stream('SELECT ...');
