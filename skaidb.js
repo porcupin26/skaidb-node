@@ -360,6 +360,49 @@ function bindParams(sql, params) {
   return out;
 }
 
+// ---- the session database ----------------------------------------------------
+
+/** The statement that enters database `name`: quoted, `""` for a quote inside. */
+function useStatement(name) {
+  return `USE "${name.replace(/"/g, '""')}"`;
+}
+
+// One identifier as the server lexes it, past any space and `--` comments:
+// in double quotes (group 1), or a bare word (group 2). A comment runs to
+// the end of its line and is matched whole, so that no word inside one is
+// taken for a token.
+const USE_TOKEN = /(?:\s|--[^\n]*(?:\n|$))*(?:"((?:[^"]|"")*)"|([\p{Alphabetic}_][\p{Alphabetic}\p{N}_]*))/uy;
+// What may follow the last one: space and comments, with at most one `;`.
+const USE_TAIL = /^(?:\s|--[^\n]*(?:\n|$))*;?(?:\s|--[^\n]*(?:\n|$))*$/u;
+
+/**
+ * The database `sql` enters when it is exactly one `USE [DATABASE] <name>`
+ * statement — the name bare or in double quotes, an optional trailing `;` —
+ * and null for anything else, which is left alone. The client keeps the
+ * answer of a USE the server accepted, so a re-dialled connection goes back
+ * into that database before anything else is sent on it.
+ */
+function usedDatabase(sql) {
+  if (typeof sql !== 'string') return null;
+  const words = [];
+  let at = 0;
+  for (;;) {
+    USE_TOKEN.lastIndex = at;
+    const m = USE_TOKEN.exec(sql);
+    if (m === null) break;
+    if (words.length === 3) return null;
+    words.push(m[1] !== undefined ? m[1].replace(/""/g, '"') : m[2]);
+    at = USE_TOKEN.lastIndex;
+  }
+  if (words.length < 2 || !USE_TAIL.test(sql.slice(at))) return null;
+  // The server matches both words in any case, and quoted as well.
+  if (words[0].toLowerCase() !== 'use') return null;
+  // `USE database` enters a database of that name: the word is the keyword
+  // only when a name follows it.
+  if (words.length === 3 && words[1].toLowerCase() !== 'database') return null;
+  return words[words.length - 1];
+}
+
 // ---- result decoding (§3.2) -------------------------------------------------
 
 /** A Rows body, also one set of ResultSets; `r` sits just past the tag. */
@@ -450,7 +493,9 @@ class Client {
     // SNI must match a SAN on the server certificate, which is usually not
     // the address you dialled — skaidb's own certs carry DNS:skaidb.
     this.tlsServerName = opts.tlsServerName || 'skaidb';
-    // Session database, selected with USE right after the handshake.
+    // Session database, selected with USE right after the handshake — on
+    // every dial, so it is also where a re-dialled connection goes back to.
+    // A USE statement the server accepted moves it (see _noteUse).
     this.database = opts.database || null;
     this._sock = null;
     this._buf = Buffer.alloc(0);
@@ -585,7 +630,7 @@ class Client {
         this._handshake()
           .then(() => this._sendHello())
           .then(() => this.database
-            ? this._doQuery(`USE "${this.database.replace(/"/g, '""')}"`, this.consistency, 'object')
+            ? this._doQuery(useStatement(this.database), this.consistency, 'object')
                 .then(() => undefined)
             : undefined)
           .then(resolve, (e) => {
@@ -774,6 +819,17 @@ class Client {
     return frame;
   }
 
+  /**
+   * The server accepted `sql`, sent as text: when it is a USE statement the
+   * session is in another database now, and that is the one to re-enter
+   * after a re-dial — a new connection starts in the default database, where
+   * the next statement would find another table of the same name.
+   */
+  _noteUse(sql) {
+    const name = usedDatabase(sql);
+    if (name !== null) this.database = name;
+  }
+
   /** A statement succeeded: a pool with read-your-writes remembers which member took a write. */
   _noteStatement(sql) {
     if (this._pool !== null && isWrite(sql)) this._pool._wrote(this);
@@ -849,7 +905,10 @@ class Client {
           }
         }
       }
-      return this._doQuery(bindParams(text, params), consistency, rowMode);
+      const sent = bindParams(text, params);
+      const res = await this._doQuery(sent, consistency, rowMode);
+      if (res.command === 'DDL') this._noteUse(sent);
+      return res;
     }).then((res) => {
       this._noteStatement(text);
       return res;
@@ -971,7 +1030,11 @@ class Client {
         this.stream.affected = safeInt(first.u64());
         return;
       }
-      if (tag === 2) { this.stream.command = 'DDL'; return; }
+      if (tag === 2) {
+        this.stream.command = 'DDL';
+        if (request[0] === 5) this._noteUse(sql);          // sent as text, exactly as given
+        return;
+      }
       if (tag === 8) {
         // ResultSets: a CALL whose body EMITted is answered with every set
         // in ONE frame, streamed or not — the frame query() receives,
@@ -2159,7 +2222,7 @@ module.exports = { Client, Pool, SkaidbError, TransactionConflictError, CONSISTE
 // for the driver's own unit tests. Not part of the supported API: anything
 // under `_internal` may change between minor versions without notice.
 module.exports._internal = {
-  Reader, decodeValue, encodeValue, bindParams, toQmark, quote,
+  Reader, decodeValue, encodeValue, bindParams, toQmark, quote, usedDatabase,
   decimalToString, formatUuid, encStr, u32le, resolveConsistency,
   DRAIN_BUDGET_BYTES, AUTH_MECHANISM, authStartFrame, parseAuthOutcome, scramProof,
   parseEndpoint, isWrite, memberFault,

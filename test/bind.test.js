@@ -84,6 +84,39 @@ test('toQmark keeps literals and typed values intact', () => {
   assert.deepEqual(I.toQmark('SELECT 1', []), { sql: 'SELECT 1', params: [] });
 });
 
+test('usedDatabase reads the database of exactly one USE statement, and nothing else', () => {
+  const db = I.usedDatabase;
+  // USE [DATABASE] <name>, any case; the name bare or in double quotes; an
+  // optional ';'; space and `--` comments wherever the server skips them.
+  for (const sql of ['USE app', 'use app', 'Use  App'.replace('App', 'app'), 'USE DATABASE app', 'use database app',
+    'USE "app"', 'USE DATABASE "app"', 'USE app;', '  USE app  ;  ', 'USE\tapp\n', 'USE app -- why',
+    '-- first\nUSE app', 'USE -- which\n app ; -- done']) {
+    assert.equal(db(sql), 'app', sql);
+  }
+  assert.equal(db('USE App'), 'App');                       // names are case-sensitive
+  assert.equal(db('USE zażółć_1'), 'zażółć_1');
+  assert.equal(db('USE "my db"'), 'my db');
+  assert.equal(db('USE "select"'), 'select');
+  assert.equal(db('USE "a""b"'), 'a"b');                    // "" is a quote inside
+  assert.equal(db('USE "-- not a comment"'), '-- not a comment');
+  // A database called `database`: the word is the keyword only when a name follows it.
+  assert.equal(db('USE database'), 'database');
+  assert.equal(db('USE DATABASE'), 'DATABASE');
+  assert.equal(db('USE DATABASE database'), 'database');
+  assert.equal(db('USE "database"'), 'database');
+  // The server takes either word in quotes too.
+  assert.equal(db('USE "database" app'), 'app');
+  assert.equal(db('"use" app'), 'app');
+  // Anything that is not exactly one such statement is left alone.
+  for (const sql of ['', 'USE', 'USE ;', 'SELECT 1', 'USER app', 'USEapp', 'USE app extra', 'USE app; USE other',
+    'USE app; SELECT 1', 'USE app.notes', "USE 'app'", 'USE $1', 'USE ?', 'USE 1app', 'USE "app', 'USE app"',
+    'USE DATABASE app other', 'USE other app', '/* c */ USE app', 'USE app;;', 'EXPLAIN USE app',
+    'SELECT use FROM t', 'CREATE DATABASE app']) {
+    assert.equal(db(sql), null, sql);
+  }
+  assert.equal(db(undefined), null);
+});
+
 test('resolveConsistency accepts numbers and names, rejects the rest', () => {
   assert.equal(I.resolveConsistency(undefined), CONSISTENCY.QUORUM);
   assert.equal(I.resolveConsistency('one'), 0);

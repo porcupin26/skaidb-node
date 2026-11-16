@@ -530,8 +530,9 @@ Every error the driver raises is a `SkaidbError` (an `Error` subclass).
   / `connection closed` (`connection lost: read ECONNRESET` and the like
   when the socket reported an error, which is then the `cause`) and mark
   the client *broken*, not closed. The next
-  statement **re-dials** (through the seed walk), re-authenticates, re-sends
-  `USE <database>` and clears the prepared-statement cache — except inside
+  statement **re-dials** (through the seed walk), re-authenticates, re-enters
+  the session database — the `database` option, or the one last entered
+  with a `USE` statement — and clears the prepared-statement cache — except inside
   `transaction()`, which never reconnects mid-transaction. Because the failed
   statement *may* have executed, the driver never retries it for you: retry a
   write only if it is idempotent. `isUsable()` reports the state.

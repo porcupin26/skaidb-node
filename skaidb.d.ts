@@ -76,7 +76,10 @@ export interface ClientOptions {
    * password (requires `tlsClientCert`/`tlsClientKey`). Default `'scram'`.
    */
   authMechanism?: AuthMechanism;
-  /** Session database, selected with `USE` right after the handshake (and after every reconnect). */
+  /**
+   * Session database, entered with `USE` right after the handshake (and
+   * after every reconnect). A `USE` statement sent later replaces it.
+   */
   database?: string;
 }
 
@@ -231,6 +234,11 @@ export class Client {
   tlsClientCert: string | null;
   tlsClientKey: string | null;
   authMechanism: AuthMechanism;
+  /**
+   * The session database a re-dialled connection goes back into: the
+   * option's, or the one last entered with a `USE` statement; `null` for
+   * the server's default.
+   */
   database: string | null;
 
   /**

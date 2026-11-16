@@ -798,6 +798,56 @@ test('the database option is re-entered on a re-dialled connection before anythi
   });
 });
 
+test('a database entered with a USE statement is re-entered on a re-dialled connection', async () => {
+  const session = sessionServer();
+  await withServer({ handle: session.handle }, async (srv) => {
+    // Every form the server takes for it, through query() and through stream().
+    const forms = [
+      (c) => c.query('USE app'),
+      (c) => c.query('use database app'),
+      (c) => c.query('  USE "app" ;  '),
+      (c) => c.query('USE app -- the application\'s own'),
+      (c) => c.query({ text: 'USE app' }),
+      (c) => collect(c.stream('USE app')),
+    ];
+    for (const [i, enter] of forms.entries()) {
+      session.ran.length = 0;
+      const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+      await c.connect();
+      assert.equal(c.database, null);
+      await enter(c);
+      assert.equal(c.database, 'app', `form ${i}`);
+      assert.deepEqual(await countThenInsertAfterALoss(c, srv), ['app', 1], `form ${i}`);
+      assert.deepEqual(session.where(), ['app: SELECT count(*) FROM notes', 'app: INSERT INTO notes (id) VALUES (?)'], `form ${i}`);
+      await c.end();
+    }
+
+    // The last database entered is the one that counts, over the option too;
+    // a USE the server refused changes nothing.
+    session.ran.length = 0;
+    session.refuse.add('nope');
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret', database: 'first' });
+    await c.connect();
+    await c.query('USE second');
+    await c.query('USE app');
+    await assert.rejects(c.query('USE nope'), /database "nope" does not exist/);
+    await assert.rejects(collect(c.stream('USE nope')), /database "nope" does not exist/);
+    assert.equal(c.database, 'app');
+    assert.deepEqual(await countThenInsertAfterALoss(c, srv), ['app', 1]);
+
+    // It cannot be entered on the new connection: the statement fails with
+    // that error and runs nowhere — not in the option's database either.
+    session.ran.length = 0;
+    session.refuse.add('app');
+    srv.closeAll();
+    await until(() => !c.isUsable());
+    await assert.rejects(c.query('INSERT INTO notes (id) VALUES (8)'),
+      (e) => e instanceof SkaidbError && /database "app" does not exist/.test(e.message));
+    assert.deepEqual(session.where(), []);
+    await c.end();
+  });
+});
+
 test('a connection reset under a statement rejects it with a SkaidbError, as any lost connection does', async () => {
   // The socket reports a reset as an 'error' (ECONNRESET), not as a close.
   const sent = [];

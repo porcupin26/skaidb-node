@@ -81,7 +81,8 @@ new Client({ seeds: ['db1:7000', 'db2:7000', 'db3:7000'], user, password });
 
 The seeds are shuffled and tried until one connects **and authenticates**.
 The same walk runs when a connection is lost later: the next statement on the
-client re-dials, re-authenticates, re-selects the database, and runs. The
+client re-dials, re-authenticates, re-enters the database it was in (the
+`database` option, or one entered since with a `USE` statement), and runs. The
 statement that was in flight when the connection died is rejected and never
 retried by the driver (it may have executed).
 

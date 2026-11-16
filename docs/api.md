@@ -16,7 +16,7 @@ Everything is exported from the package root. Types for TypeScript are in
 | `seeds` | `string[]` | — | `['h1:7000', 'h2:7000', 'h3']`. Overrides `host`/`port`. Shuffled on every connect. |
 | `user` | `string` | `'anonymous'` (`''` with certificate login) | User name. With `authMechanism: 'certificate'` it only asserts the identity (must equal the certificate's CN). |
 | `password` | `string` | `''` | Password. Empty means anonymous; mutual authentication is skipped. |
-| `database` | `string` | — | Selected with `USE` after every (re)connect. |
+| `database` | `string` | — | The session database: entered with `USE` after every (re)connect. A `USE` statement sent later replaces it for this client ([reconnect](#reconnect)). |
 | `consistency` | `'ONE' \| 'QUORUM' \| 'ALL' \| 0 \| 1 \| 2` | `'QUORUM'` | Default for every statement on this client. Names are case-insensitive. |
 | `connectTimeout` | `number` (ms) | `10000` | Per seed, covering TCP connect and the TLS handshake. |
 | `tls` | `boolean` | `false` | TLS with the system trust store. |
@@ -41,7 +41,9 @@ Public fields after construction: `host`, `port` (the endpoint most recently
 dialled), `seeds` (parsed to `{ host, port }`), `user`, `password`,
 `consistency` (resolved to `0 | 1 | 2`), `connectTimeout`, `tls`, `tlsCa`,
 `tlsInsecure`, `tlsServerName`, `tlsClientCert`, `tlsClientKey`,
-`authMechanism` (`'scram'` or `'certificate'`), `database`.
+`authMechanism` (`'scram'` or `'certificate'`), `database` (the session
+database the client goes back into after a re-dial: the option's, or the
+one last entered with a `USE` statement; `null` for the server's default).
 
 ### `client.connect(): Promise<void>`
 
@@ -299,6 +301,17 @@ is cleared. The driver never re-runs the failed statement: it may have
 executed on the server, and retrying a write could duplicate it. A protocol
 desync (an unexpected frame) is handled the same way: the connection is
 dropped rather than reused misaligned.
+
+The session database survives the re-dial. A new connection starts in the
+server's default database, so before anything else is sent on it the client
+re-enters the database it was in: the `database` option, or the one last
+entered with a `USE` statement. A `USE [DATABASE] <name>` the server
+accepted is noted when it goes through `query()` or `stream()` as one
+statement of its own — the name bare or in double quotes, an optional
+trailing `;`; text the client cannot read as exactly that is left alone, and
+`client.database` says what it holds. If the database cannot be entered on
+the new connection, the statement rejects with `no reachable endpoint in …:
+<the server's error>` and is not sent: it never runs in another database.
 
 ## `new Pool(options?)`
 
