@@ -32,6 +32,12 @@ const STATEMENT_TABLE_FULL = 'too many prepared statements';
 const STREAM_DROPPED = 'stream abandoned: the transaction that opened it ended while it was open, '
   + 'and its connection was closed';
 
+// How long a connection may have been silent and still be written to without
+// a look (see _look): long enough that statements sent back to back never
+// wait for it, short enough that a connection the application comes back to
+// after doing anything else is looked at.
+const IDLE_LOOK_MS = 1;
+
 // How much of an abandoned stream is worth reading out before dropping the
 // connection instead. The server sends ~256 KB row chunks, so this is a few
 // dozen of them: past that, transferring the remainder of a large scan costs
@@ -570,6 +576,7 @@ class Client {
     this._buf = Buffer.alloc(0);
     this._waiters = [];       // queue of {resolve, reject} awaiting a frame
     this._frames = [];        // frames that arrived before a reader asked
+    this._heard = 0;          // when the socket last said anything (performance.now())
     this._queryChain = Promise.resolve();
     this._closed = false;      // end() was called: terminal
     this._broken = false;      // transport died: recoverable on next statement
@@ -761,7 +768,14 @@ class Client {
         // right after an abandoned stream failed with "connection lost".
         sock.on('data', (d) => { if (this._sock === sock) this._onData(d); });
         sock.on('error', (e) => { if (this._sock === sock) this._fail(e); });
+        // The peer's FIN is the end of the connection: no answer can come
+        // after it. Acted on here, not at the 'close' that follows it only
+        // once this side's half has been shut down too, a turn or two of
+        // the event loop later — time in which a request would still be
+        // written to a connection that is already gone.
+        sock.on('end', () => { if (this._sock === sock) this._fail(new SkaidbError('connection closed')); });
         sock.on('close', () => { if (this._sock === sock) this._fail(new SkaidbError('connection closed')); });
+        this._heard = performance.now();
         this._handshake()
           .then(() => this._sendHello())
           .then(() => this._enterSession())
@@ -806,6 +820,7 @@ class Client {
   }
 
   _onData(d) {
+    this._heard = performance.now();
     this._buf = Buffer.concat([this._buf, d]);
     // Parse as many complete frames as available.
     for (;;) {
@@ -868,6 +883,37 @@ class Client {
   }
 
   /**
+   * Look at a connection that has been idle, before a request is written on
+   * it.
+   *
+   * A member restart, a failover or an idle timeout closes idle
+   * connections, and the close reaches this client as an event of the
+   * socket — which waits for the event loop. A request written before the
+   * loop got to that event goes into a connection that is already dead: on
+   * a real network the write even succeeds, only the read fails, and the
+   * statement is lost to a connection that died minutes ago. So a
+   * connection that has been silent for a moment is given a turn of the
+   * event loop first: whatever its socket has to say — EOF, a reset — is
+   * delivered, marks the client broken, and the caller re-dials (or, in a
+   * transaction, reports the loss). It costs no round trip, and statements
+   * sent back to back do not pay for it.
+   *
+   * Two setImmediate()s, not one: the first runs right after the I/O
+   * callbacks of the turn in progress, which may have been collected before
+   * the close arrived; between the first and the second lies a whole poll
+   * for I/O.
+   */
+  async _look() {
+    if (this._sock === null || this._broken || this._closed) return;
+    if (performance.now() - this._heard < IDLE_LOOK_MS) return;
+    await new Promise(setImmediate);
+    await new Promise(setImmediate);
+    // Alive as of now: the pool's look at checkout and the look of the
+    // statement that follows it are one.
+    if (this._sock !== null && !this._broken) this._heard = performance.now();
+  }
+
+  /**
    * Re-dial if the transport died, before anything is prepared or sent.
    *
    * The prepared-statement cache MUST be cleared: an id is only valid on the
@@ -878,6 +924,8 @@ class Client {
   async _ensureLive() {
     if (this._closed) throw new SkaidbError('connection is closed');
     if (this._reconnecting) return;
+    await this._look();
+    if (this._closed) throw new SkaidbError('connection is closed');   // ended during the look
     if (!this._broken) {
       // No connection, and none was lost: connect() was never called, has
       // not finished (the socket may exist, mid-handshake), or failed.
@@ -1925,6 +1973,9 @@ class Pool extends EventEmitter {
         await conn._connectVia(this._order(target));
         conn._poolEp = conn._connected;
         await this._discoverThrough(conn);
+      } else {
+        // An idle one: what its socket has to say is heard first.
+        await conn._look();
       }
       // A connection the server closed while it sat idle still looks fine
       // locally, so validate before handing it out; discard and try again.

@@ -547,6 +547,14 @@ Every error the driver raises is a `SkaidbError` (an `Error` subclass).
   `transaction()`, which never reconnects mid-transaction. Because the failed
   statement *may* have executed, the driver never retries it for you: retry a
   write only if it is idempotent. `isUsable()` reports the state.
+- **A connection closed while it was idle** — a member restarted, failed
+  over, or timed the connection out — costs no statement: the client hears
+  of the close before it writes the next request, re-dials, and the
+  statement runs with no error (inside a transaction it is reported as the
+  lost connection it is). A connection that has been silent for more than
+  a millisecond is looked at first, which takes a turn of the event loop
+  and no round trip, so a close that arrived while your code kept the
+  event loop busy is seen as well.
 - **Protocol desync** (an unexpected frame): the driver drops the connection
   (`isUsable()` → false) rather than hand the next caller a misaligned reply,
   and the next statement reconnects.

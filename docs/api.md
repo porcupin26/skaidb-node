@@ -316,6 +316,16 @@ executed on the server, and retrying a write could duplicate it. A protocol
 desync (an unexpected frame) is handled the same way: the connection is
 dropped rather than reused misaligned.
 
+A connection that the server closed while the client was idle — a member
+restart, a failover, an idle timeout — is found out before the next request
+is written, so the statement re-dials and runs instead of failing on a
+connection that died minutes ago. The close reaches the client as an event
+of the socket; a connection that has been silent for more than a
+millisecond is therefore given a turn of the event loop before a request
+goes out on it (and before a pool hands it out), which costs no round trip
+and delivers a close that arrived while the application kept the event
+loop busy. Statements sent back to back are not delayed.
+
 The session database survives the re-dial. A new connection starts in the
 server's default database, so before anything else is sent on it the client
 re-enters the database it was in: the `database` option, or the one last
@@ -364,7 +374,7 @@ An unknown `loadBalancing` or `idleOrder`, `maxsize < 1` or
 
 | Member | Meaning |
 |---|---|
-| `pool.acquire(options?): Promise<Client>` | An idle connection to the member the policy picks, validated with `isUsable()` (a dead one is discarded and the next tried), or one freshly dialed to it — a failed dial falls through to the other usable members, then to the unusable ones. `options.affinity` (any value; a user or session id) scopes `readYourWrites`; without it checkouts share one pool-wide key. Rejects with `pool is closed` after `end()`, with `no reachable endpoint in …` when no member can be dialed, with the server's own error when a member was reached and refused the session (the pool's `database` does not exist), and with `every new connection broke during member discovery` when, with `discover`, three new connections in a row were lost to a member that takes the login and never answers `SHOW ENDPOINTS`. |
+| `pool.acquire(options?): Promise<Client>` | An idle connection to the member the policy picks, validated with `isUsable()` after its socket's pending events were heard (one the server closed while it sat idle is discarded and the next tried), or one freshly dialed to it — a failed dial falls through to the other usable members, then to the unusable ones. `options.affinity` (any value; a user or session id) scopes `readYourWrites`; without it checkouts share one pool-wide key. Rejects with `pool is closed` after `end()`, with `no reachable endpoint in …` when no member can be dialed, with the server's own error when a member was reached and refused the session (the pool's `database` does not exist), and with `every new connection broke during member discovery` when, with `discover`, three new connections in a row were lost to a member that takes the login and never answers `SHOW ENDPOINTS`. |
 | `pool.release(conn): Promise<void>` | Returns a connection; closes it instead when it is broken, its member is ejected, not `ready` or gone, the pool is closed, `maxsize` idle connections already exist, or a `transaction()` may still be open on it (one still running, or one whose `ROLLBACK` failed). A connection its borrower moved to another database with `USE` is first put back into the pool's `database` (and closed if that fails), so the next borrower starts there; a pool without a `database` option leaves the connection where its borrower left it. |
 | `pool.withConnection(fn)` · `pool.withConnection(options, fn)`: `Promise<T>` | `acquire(options)`, run `fn(conn)`, `release()` however `fn` ends. |
 | `pool.transaction(body, opts?): Promise<T>` | [`client.transaction(body, opts)`](#clienttransactionbody-opts-promiset) on one checked-out connection: checked out once, held for every statement and every run, released however it ends. `body` gets that connection. `opts = { attempts?, begin?, affinity? }`, `affinity` as in `acquire()`. Bad arguments reject before a connection is checked out. |

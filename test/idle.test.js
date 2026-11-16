@@ -14,6 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { Worker } = require('worker_threads');
 const { Client, Pool, SkaidbError } = require('../skaidb');
 const { FakeServer, F } = require('./fake-server');
 
@@ -160,6 +161,98 @@ test('inside transaction() a connection the server closed is a lost transaction,
       // The transaction over, the next statement re-dials as usual.
       assert.deepEqual((await c.query('SELECT 1')).rows, [{ v: 1 }], how);
       assert.equal(srv.connections, 2, how);
+      await c.end();
+    });
+  }
+});
+
+// ---- the close arrives while the client's event loop is busy -----------------
+
+// The scripted server in a worker thread (idle-peer.js). The close of a
+// socket reaches a Node program as an event, and events wait for the event
+// loop: `closeWhileBusy` has the server close the first connection while
+// this thread is blocked, so that when it returns the FIN (or the reset) has
+// arrived and the client has not been told.
+async function peer() {
+  const flag = new Int32Array(new SharedArrayBuffer(4));
+  const worker = new Worker(path.join(__dirname, 'idle-peer.js'), { workerData: { flag } });
+  const inbox = [];
+  const waiting = [];
+  worker.on('message', (m) => { const w = waiting.shift(); if (w) w(m); else inbox.push(m); });
+  const next = () => (inbox.length ? Promise.resolve(inbox.shift()) : new Promise((r) => waiting.push(r)));
+  const { port } = await next();
+  return {
+    port,
+    closeWhileBusy(how) {
+      Atomics.store(flag, 0, 0);
+      worker.postMessage(how);
+      assert.notEqual(Atomics.wait(flag, 0, 0, 5000), 'timed-out');         // blocks: no event is delivered here
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);     // … while the close crosses loopback
+    },
+    report() { worker.postMessage('report'); return next(); },
+    stop() { worker.postMessage('stop'); return new Promise((r) => worker.once('exit', r)); },
+  };
+}
+
+async function withPeer(fn) {
+  const p = await peer();
+  try { return await fn(p); } finally { await p.stop(); }
+}
+
+test('a close that arrived while the event loop was busy is seen before the statement is written', async () => {
+  for (const how of ['half-close', 'reset']) {
+    for (const [name, run] of Object.entries(STATEMENTS)) {
+      await withPeer(async (p) => {
+        const c = new Client({ host: '127.0.0.1', port: p.port, password: 'secret' });
+        await c.connect();
+        await c.query('SELECT 1');
+        p.closeWhileBusy(how);
+        assert.equal(c.isUsable(), true, 'the client has not been told yet');
+        await settles(run(c));                              // called in the same turn: no error all the same
+        assert.deepEqual(await p.report(), { connections: 2, late: 0, lateRequests: 0 }, `${how}, ${name}`);
+        await c.end();
+      });
+    }
+  }
+});
+
+test('Pool: a close that arrived while the event loop was busy keeps the idle connection from being handed out', async () => {
+  for (const how of ['half-close', 'reset']) {
+    await withPeer(async (p) => {
+      const pool = new Pool({ host: '127.0.0.1', port: p.port, password: 'secret' });
+      try {
+        const idle = await pool.acquire();
+        await idle.query('SELECT 1');
+        await pool.release(idle);
+        p.closeWhileBusy(how);
+        assert.equal(idle.isUsable(), true, 'the pool has not been told yet');
+        const conn = await settles(pool.acquire());
+        assert.notEqual(conn, idle, how);
+        assert.deepEqual((await settles(conn.query('SELECT 1'))).rows, [{ v: 1 }], how);
+        await pool.release(conn);
+        assert.deepEqual(await p.report(), { connections: 2, late: 0, lateRequests: 0 }, how);
+      } finally {
+        await pool.end();
+      }
+    });
+  }
+});
+
+test('inside transaction() a close that arrived while the event loop was busy is a lost transaction, and nothing is written', async () => {
+  for (const how of ['half-close', 'reset']) {
+    await withPeer(async (p) => {
+      const c = new Client({ host: '127.0.0.1', port: p.port, password: 'secret' });
+      await c.connect();
+      let caught;
+      const out = await settles(c.transaction(async (tx) => {
+        await tx.query('INSERT INTO t (id) VALUES (1)');
+        p.closeWhileBusy(how);
+        caught = await settles(tx.query('INSERT INTO t (id) VALUES (2)')).catch((e) => e);
+      })).catch((e) => e);
+      for (const e of [caught, out]) {
+        assert.ok(e instanceof SkaidbError && e.message === 'connection lost during a transaction', `${how}: ${e}`);
+      }
+      assert.deepEqual(await p.report(), { connections: 1, late: 0, lateRequests: 0 }, how);
       await c.end();
     });
   }
