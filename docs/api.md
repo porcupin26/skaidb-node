@@ -201,6 +201,40 @@ client that has one running — from inside `body` too — rejects with `a
 transaction is already running on this connection` before anything is sent.
 Use a `Pool` (`pool.transaction()`) for transactions that run concurrently.
 
+#### A transaction written by hand
+
+`BEGIN … COMMIT` sent with `query()` (or `stream()`) is a transaction to the
+client as well. It notes a statement the server accepted whose first word
+is `BEGIN` — `BEGIN`, `BEGIN TRANSACTION`, `BEGIN ATOMIC …`, as one statement
+of its own, any case, an optional trailing `;`, `--` comments allowed — and
+the statement that is exactly `COMMIT [TRANSACTION]` or `ROLLBACK
+[TRANSACTION]`, which ends the transaction once it is answered, with
+success or with an error (a refused `COMMIT` has ended it too). The
+statements `transaction()` sends are not noted: it keeps track of its own.
+
+While such a transaction is open the client does not
+[reconnect](#reconnect) either:
+
+- the statement under which the connection is lost rejects with the usual
+  `connection lost` / `connection closed`;
+- every later statement — `query()`, `batch()`, `stream()`, a `BEGIN` or a
+  `USE` included — rejects with `connection lost during a transaction` and
+  is sent nowhere, also after a `connect()` by hand: a new connection has
+  no transaction open, and the rest of this one would commit statement by
+  statement;
+- the application ends it: `ROLLBACK` resolves as the server's would (`{
+  command: 'DDL', … }`) without being sent, since the server dropped the
+  transaction with the connection, and `COMMIT` rejects with `connection
+  lost during a transaction: COMMIT was not sent and nothing was
+  committed`. After either the next statement re-dials as usual, back into
+  the session's database and settings;
+- a connection that goes while the `COMMIT` itself is in flight leaves the
+  outcome unknown, and the `COMMIT` rejects with `connection lost under
+  COMMIT: it is not known whether the transaction was committed (<the
+  connection error>)`, that error being the `cause`. One that goes under
+  the `ROLLBACK` rejects it with the connection error; the transaction is
+  over all the same.
+
 ### `client.stream(sql, values?, opts?)` → `AsyncGenerator<Row>`
 
 `opts = { values?, consistency?, rowMode? }`. Yields the statement's rows
@@ -309,8 +343,9 @@ example `connection lost: read ECONNRESET` — and the socket's error is the
 `SkaidbError`'s `cause`.
 The next `query()`, `batch()` or `stream()` first re-dials — the full seed
 walk, handshake, Hello, `USE` and the session's settings — then runs (except while a
-[`transaction()`](#clienttransactionbody-opts-promiset) is open, which
-fails instead). The prepared-statement cache
+transaction is open — [`transaction()`](#clienttransactionbody-opts-promiset)'s,
+or [one opened with a `BEGIN` statement](#a-transaction-written-by-hand) —
+which fails instead). The prepared-statement cache
 is cleared. The driver never re-runs the failed statement: it may have
 executed on the server, and retrying a write could duplicate it. A protocol
 desync (an unexpected frame) is handled the same way: the connection is

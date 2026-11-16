@@ -27,6 +27,10 @@ const PREPARED_CACHE_MAX = 240;
 // full: "too many prepared statements (max 256); close some first".
 const STATEMENT_TABLE_FULL = 'too many prepared statements';
 
+// What every statement of a transaction is told once the connection that
+// transaction was on is gone: nothing more of it is sent.
+const LOST_IN_TRANSACTION = 'connection lost during a transaction';
+
 // What a stream throws when it is resumed after transaction() closed the
 // connection under it (its body left the stream open).
 const STREAM_DROPPED = 'stream abandoned: the transaction that opened it ended while it was open, '
@@ -439,14 +443,20 @@ function withoutLineComments(sql) {
 /**
  * The words of `sql` when it is exactly one statement: its comments and an
  * optional trailing `;` gone, split at whitespace. null when there is no
- * statement, or a `;` is left — more than one statement, which the server
- * refuses anyway.
+ * statement, or a `;` is left outside a quoted name or string — more than
+ * one statement, which the server refuses anyway.
  */
 function statementWords(sql) {
   if (typeof sql !== 'string') return null;
   let text = withoutLineComments(sql).trim();
   if (text.endsWith(';')) text = text.slice(0, -1).trimEnd();
-  if (text === '' || text.includes(';')) return null;
+  if (text === '') return null;
+  let quote = null;
+  for (const ch of text) {
+    if (quote !== null) { if (ch === quote) quote = null; }
+    else if (ch === ';') return null;
+    else if (ch === '"' || ch === "'") quote = ch;
+  }
   return text.split(/\s+/u);
 }
 
@@ -470,6 +480,21 @@ function sessionSetting(sql) {
   else if (word(1) === 'scan' && word(2) === 'budget') { kind = 'scanBudget'; next = 3; }
   else return null;
   return { kind, text: word(next) === 'default' ? null : words.join(' ') };
+}
+
+/**
+ * What `sql` does to a transaction when it is exactly one statement:
+ * `'begin'` for one whose first word is BEGIN (`BEGIN`, `BEGIN TRANSACTION`,
+ * `BEGIN ATOMIC …`), `'commit'` or `'rollback'` for exactly `COMMIT
+ * [TRANSACTION]` or `ROLLBACK [TRANSACTION]`, and null for anything else.
+ */
+function transactionStatement(sql) {
+  const words = statementWords(sql);
+  if (words === null) return null;
+  const first = words[0].toLowerCase();
+  if (first === 'begin') return 'begin';
+  if (first !== 'commit' && first !== 'rollback') return null;
+  return words.length === 1 || (words.length === 2 && words[1].toLowerCase() === 'transaction') ? first : null;
 }
 
 // ---- result decoding (§3.2) -------------------------------------------------
@@ -592,6 +617,12 @@ class Client {
     // answered, 'open' from then until the transaction ends, else null.
     this._txn = null;
     this._txnRollbackFailed = false;   // the last transaction()'s clean-up ROLLBACK did not go through
+    // A transaction the application opened itself, with a BEGIN statement
+    // the server accepted, noted the way a USE is: 'open' until its COMMIT
+    // or ROLLBACK is answered; 'lost' once the connection it was on is gone,
+    // until the application ends it with a COMMIT or ROLLBACK, neither of
+    // which is sent then; else null. transaction() keeps its own (_txn).
+    this._handTxn = null;
     // Streams that hold this connection or wait for it, each as {release,
     // dropped} (see stream()): transaction() takes the connection back from
     // the ones its body left open.
@@ -681,6 +712,9 @@ class Client {
   _letGo(err) {
     const sock = this._sock;
     if (sock === null) return;
+    // A transaction the application opened on it goes with it: a
+    // connect() by hand must not let the rest of it run on the new one.
+    if (this._handTxn === 'open') this._handTxn = 'lost';
     const waiting = this._waiters;
     this._sock = null;
     this._buf = Buffer.alloc(0);
@@ -860,6 +894,7 @@ class Client {
   _fail(err) {
     if (this._closed || this._broken) return;
     this._broken = true;
+    if (this._handTxn === 'open') this._handTxn = 'lost';
     // The socket's own error (ECONNRESET, EPIPE, ETIMEDOUT, a TLS alert) is
     // a plain Error: the caller gets a SkaidbError like for every other
     // lost connection, with that error as its `cause`.
@@ -953,6 +988,13 @@ class Client {
     if (this._reconnecting) return;
     await this._look();
     if (this._closed) throw new SkaidbError('connection is closed');   // ended during the look
+    // A transaction lives on the connection its BEGIN went out on and died
+    // with it. Sending the rest of it — and its COMMIT — on another
+    // connection, where no transaction is open, would commit each statement
+    // on its own: fail instead, sending nothing. This is the transaction
+    // the application opened by hand, which stays lost until its COMMIT or
+    // ROLLBACK (see _endLostTransaction), whatever was dialled since.
+    if (this._handTxn === 'lost') throw new SkaidbError(LOST_IN_TRANSACTION);
     if (!this._broken) {
       // No connection, and none was lost: connect() was never called, has
       // not finished (the socket may exist, mid-handshake), or failed.
@@ -961,11 +1003,8 @@ class Client {
       if (this._connected === null) throw new SkaidbError('not connected: await connect() first');
       return;
     }
-    // A transaction lives on the connection its BEGIN went out on and died
-    // with it. Re-dialling here would send the rest of it — and its COMMIT —
-    // to a connection with no transaction open, where each statement
-    // autocommits on its own: fail instead, sending nothing.
-    if (this._txn === 'open') throw new SkaidbError('connection lost during a transaction');
+    // … and this is transaction()'s own: no re-dial while it is open.
+    if (this._txn === 'open') throw new SkaidbError(LOST_IN_TRANSACTION);
     this._reconnecting = true;
     try {
       // Pooled: the pool's current order (usable members first, the one
@@ -1003,6 +1042,56 @@ class Client {
     if (!this._adrift) return;
     this._adrift = false;
     this._fail(new SkaidbError('connection closed: it was not in the session database'));
+  }
+
+  /**
+   * The COMMIT or ROLLBACK (`kind`) that ends a transaction the application
+   * opened by hand, when `sql` is one and the statement is not one of
+   * transaction()'s own; else null.
+   */
+  _ending(sql) {
+    if (this._txn !== null) return null;
+    const kind = transactionStatement(sql);
+    return kind === 'commit' || kind === 'rollback' ? kind : null;
+  }
+
+  /**
+   * Whether the statement that ends a hand-written transaction (`kind`, see
+   * _ending) finds it lost: then it is settled here, without the server.
+   */
+  _lostBefore(kind) {
+    return kind !== null && this._handTxn === 'lost' && !this._closed;
+  }
+
+  /**
+   * The application ends a transaction whose connection is gone. Nothing is
+   * sent: the server discarded the transaction with the connection, so a
+   * ROLLBACK has happened already and is answered as the server answers
+   * one, and a COMMIT cannot happen — it says so. Either way the
+   * transaction is over, and the next statement re-dials as usual.
+   */
+  _endLostTransaction(kind) {
+    this._handTxn = null;
+    if (kind === 'rollback') return { command: 'DDL', rowCount: null, rows: [], fields: [] };
+    throw new SkaidbError(`${LOST_IN_TRANSACTION}: COMMIT was not sent and nothing was committed`);
+  }
+
+  /**
+   * A COMMIT or ROLLBACK (`kind`, see _ending) failed with `e`: the error to
+   * throw. The transaction is over whatever the server answered — a refused
+   * COMMIT has ended it too — and equally when the connection went under
+   * the statement. Under a COMMIT that leaves the outcome unknown: the
+   * server may have committed before its answer went missing, and the
+   * error says that instead of the bare connection error.
+   */
+  _endFailed(kind, e) {
+    if (kind === null) return e;
+    const open = this._handTxn !== null;
+    this._handTxn = null;
+    if (!open || kind !== 'commit' || statementErrors.has(e)) return e;
+    return new SkaidbError(
+      `connection lost under COMMIT: it is not known whether the transaction was committed (${e.message})`,
+      { cause: e });
   }
 
   /**
@@ -1072,12 +1161,18 @@ class Client {
    * same name. A SET CONSISTENCY or SET SCAN BUDGET statement is the
    * setting of its kind from now on, or clears it (DEFAULT) — a new
    * connection reads at the request's own level, with no limit on a scan.
+   * A BEGIN opened a transaction, which lives on this connection alone
+   * until a COMMIT or ROLLBACK ends it — unless it is transaction()'s own,
+   * which that keeps track of itself.
    */
   _noteSession(sql) {
     const name = usedDatabase(sql);
     if (name !== null) { this.database = name; this._adrift = false; return; }
     const setting = sessionSetting(sql);
-    if (setting !== null) this._settings[setting.kind] = setting.text;
+    if (setting !== null) { this._settings[setting.kind] = setting.text; return; }
+    if (this._txn !== null) return;
+    const kind = transactionStatement(sql);
+    if (kind !== null) this._handTxn = kind === 'begin' ? 'open' : null;
   }
 
   /** A statement succeeded: a pool with read-your-writes remembers which member took a write. */
@@ -1137,7 +1232,13 @@ class Client {
       // Recover a transport that died since the last statement, BEFORE
       // anything is prepared on it (a stale statement id is the hazard).
       const leaving = !(params && params.length) && usedDatabase(text) !== null;
-      await this._ensureLive(leaving);
+      const ending = this._ending(text);
+      try {
+        await this._ensureLive(leaving);
+      } catch (e) {
+        if (this._lostBefore(ending)) return this._endLostTransaction(ending);
+        throw e;
+      }
       if (params && params.length) {
         // Server-side prepare so parameters travel as TYPED values; arrays
         // and documents have no SQL literal form. `$N` is rewritten to the
@@ -1161,6 +1262,8 @@ class Client {
         const res = await this._doQuery(sent, consistency, rowMode);
         if (res.command === 'DDL') this._noteSession(sent);
         return res;
+      } catch (e) {
+        throw this._endFailed(ending, e);
       } finally {
         if (leaving) this._driftedOff();
       }
@@ -1264,19 +1367,36 @@ class Client {
       // Re-dial a transport that died since the last statement, exactly as
       // query() does. Without this the request goes into a dead socket and
       // the reply never comes.
-      await this._ensureLive(leaving);
+      const ending = request[0] === 5 ? this._ending(sql) : null;
+      let settled = false;      // a ROLLBACK of a lost transaction: answered here
+      try {
+        await this._ensureLive(leaving);
+      } catch (e) {
+        if (!this._lostBefore(ending)) throw e;
+        this._endLostTransaction(ending);
+        settled = true;
+      }
       // This stream now owns the result slots: nothing stale from the
       // previous stream may describe it (a mutation has no columns).
       this.stream.columns = null;
       this.stream.command = null;
       this.stream.affected = null;
       this.stream.resultSets = null;
-      const first = new Reader(await this._request(request));
+      if (settled) {
+        this.stream.command = 'DDL';
+        return;
+      }
+      let first;
+      try {
+        first = new Reader(await this._request(request));
+      } catch (e) {
+        throw this._endFailed(ending, e);
+      }
       const tag = first.u8();
       if (tag === 3) {
         // One ordinary Error frame: the connection is at a request boundary.
         const msg = first.text();
-        if (!msg.includes('unknown opcode')) throw statementError(msg);
+        if (!msg.includes('unknown opcode')) throw this._endFailed(ending, statementError(msg));
         throw statementError(request[0] === 9            // OP_QUERY_STREAM_PARAMS
           ? `server does not support parameterised streaming (skaidb >= 0.330): ${msg}`
           : `server does not support streaming: ${msg}`);
@@ -2527,6 +2647,7 @@ module.exports = { Client, Pool, SkaidbError, TransactionConflictError, CONSISTE
 // under `_internal` may change between minor versions without notice.
 module.exports._internal = {
   Reader, decodeValue, encodeValue, bindParams, toQmark, quote, usedDatabase, sessionSetting,
+  transactionStatement,
   decimalToString, formatUuid, encStr, u32le, resolveConsistency,
   DRAIN_BUDGET_BYTES, AUTH_MECHANISM, authStartFrame, parseAuthOutcome, scramProof,
   parseEndpoint, isWrite, memberFault,

@@ -39,6 +39,7 @@ function answering() {
     if (req.op === 2) return F.prepared(0, (req.sql.match(/\?/g) || []).length);
     if (req.op === 5 || req.op === 9) return [F.header(['v']), F.chunk([[1]]), F.end()];
     if (req.op === 3 || req.op === 7) return F.mutation(1);
+    if (/^(begin|commit|rollback)\b/i.test(req.sql)) return F.ddl();
     return /^select/i.test(req.sql) ? F.rows(['v'], [[1]]) : F.mutation(1);
   };
   return { handle, seen, on: (sock) => seen.filter((s) => s.sock === sock).length };
@@ -252,6 +253,41 @@ test('inside transaction() a close that arrived while the event loop was busy is
       for (const e of [caught, out]) {
         assert.ok(e instanceof SkaidbError && e.message === 'connection lost during a transaction', `${how}: ${e}`);
       }
+      assert.deepEqual(await p.report(), { connections: 1, late: 0, lateRequests: 0 }, how);
+      await c.end();
+    });
+  }
+});
+
+test('a transaction opened with a BEGIN statement is lost the same way: a connection found closed is not replaced under it', async () => {
+  const lost = (e) => e instanceof SkaidbError && e.message === 'connection lost during a transaction';
+  // The close is heard while the client waits …
+  for (const how of ['fin', 'reset']) {
+    await withServer(async (srv, server) => {
+      const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+      await c.connect();
+      await c.query('BEGIN');
+      await c.query('INSERT INTO t (id) VALUES (1)');
+      const late = closeIdle([...srv.sockets][0], how);
+      await sleep(100);
+      assert.ok(lost(await settles(c.query('INSERT INTO t (id) VALUES (2)')).catch((e) => e)), how);
+      await assert.rejects(settles(c.query('COMMIT')), /nothing was committed/, how);
+      assert.deepEqual(server.seen.map((s) => s.sql), ['BEGIN', 'INSERT INTO t (id) VALUES (1)'], how);
+      assert.deepEqual([late.bytes, srv.connections], [0, 1], how);
+      assert.deepEqual((await c.query('SELECT 1')).rows, [{ v: 1 }], how);      // over: re-dialled
+      await c.end();
+    });
+  }
+  // … or arrived while the event loop was busy.
+  for (const how of ['half-close', 'reset']) {
+    await withPeer(async (p) => {
+      const c = new Client({ host: '127.0.0.1', port: p.port, password: 'secret' });
+      await c.connect();
+      await c.query('BEGIN');
+      await c.query('INSERT INTO t (id) VALUES (1)');
+      p.closeWhileBusy(how);
+      assert.ok(lost(await settles(c.query('INSERT INTO t (id) VALUES (2)')).catch((e) => e)), how);
+      assert.deepEqual(await settles(c.query('ROLLBACK')), { command: 'DDL', rowCount: null, rows: [], fields: [] }, how);
       assert.deepEqual(await p.report(), { connections: 1, late: 0, lateRequests: 0 }, how);
       await c.end();
     });

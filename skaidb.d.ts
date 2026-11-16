@@ -257,6 +257,12 @@ export class Client {
    * Run one statement. With parameters, the statement is prepared on the
    * server and the values travel typed; without, the text is sent as is.
    * Statements on one client are serialized.
+   *
+   * A transaction opened with a `BEGIN` statement is noted: if its
+   * connection is lost it is not re-dialled, every further statement
+   * rejects with `connection lost during a transaction` until the
+   * application ends it — `ROLLBACK` then resolves and `COMMIT` rejects
+   * (nothing was committed), neither being sent.
    */
   query<Row = any>(text: string, values?: Value[]): Promise<QueryResult<Row>>;
   query<Row = any>(config: QueryConfig, values?: Value[]): Promise<QueryResult<Row>>;

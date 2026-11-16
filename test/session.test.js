@@ -341,3 +341,186 @@ test('a USE that re-dials goes out without re-entering the database it leaves, s
     await t.end();
   });
 });
+
+// ---- L: a hand-written transaction is a transaction --------------------------
+
+const LOST = 'connection lost during a transaction';
+const NOT_COMMITTED = 'connection lost during a transaction: COMMIT was not sent and nothing was committed';
+// A transport failure as the driver reports one, and the two it reports for
+// a transaction the application opened itself.
+const isTransport = (e) => e instanceof SkaidbError && I.memberFault(e);
+const isLost = (e) => isTransport(e) && e.message === LOST;
+const diedInFlight = (e) => isTransport(e) && /^connection (closed$|lost(:|$))/.test(e.message);
+const DDL = { command: 'DDL', rowCount: null, rows: [], fields: [] };
+const insert = (c, id) => c.query(`INSERT INTO t (id) VALUES (${id})`);
+
+test('a transaction the application opens with BEGIN is not carried to a new connection: after a loss its statements fail unsent, COMMIT says nothing was committed, ROLLBACK succeeds unsent', async () => {
+  // PROTOCOL.md section 6 rule 7, for a BEGIN the application sends itself.
+  for (const end of ['COMMIT', 'ROLLBACK', 'commit transaction ;', 'ROLLBACK TRANSACTION -- give up']) {
+    await withSession(async (server, srv) => {
+      const c = await connected(srv);
+      await c.query('BEGIN');
+      await insert(c, 1);
+      await lose(c, srv);
+      // The transaction died with its connection: nothing more of it is
+      // sent — on a new session each statement would commit on its own.
+      assert.ok(isLost(await insert(c, 2).catch((e) => e)), end);
+      assert.ok(isLost(await insert(c, 3).catch((e) => e)), end);
+      if (/^commit/i.test(end)) {
+        await assert.rejects(c.query(end), (e) => isTransport(e) && e.message === NOT_COMMITTED, end);
+      } else {
+        assert.deepEqual(await c.query(end), DDL, end);     // the server rolled back when the connection went
+      }
+      assert.deepEqual(server.log, ['1: BEGIN', '1: INSERT INTO t (id) VALUES (1)'], end);
+      assert.equal(srv.connections, 1, end);
+      assert.equal(c.isUsable(), false, end);
+      // Ended, the client is what it is after any lost connection: the next
+      // statement re-dials, and none of the three rows exists.
+      assert.deepEqual(await where(c), { db: 'default', consistency: null, txn: false, ids: [] }, end);
+      assert.equal(srv.connections, 2, end);
+      await insert(c, 4);                                   // in autocommit again
+      assert.deepEqual((await where(c)).ids, [4], end);
+      await c.end();
+    });
+  }
+});
+
+test('a hand-written transaction lost under a statement, under its COMMIT, or under its ROLLBACK', async () => {
+  await withSession(async (server, srv) => {
+    // Under statement 2 itself: it gets the usual connection error, the rest the transaction's.
+    const c = await connected(srv);
+    server.dies.add('INSERT INTO t (id) VALUES (2)');
+    await c.query('BEGIN');
+    await insert(c, 1);
+    assert.ok(diedInFlight(await insert(c, 2).catch((e) => e)));
+    assert.ok(isLost(await insert(c, 3).catch((e) => e)));
+    assert.deepEqual(await c.query('ROLLBACK'), DDL);
+    assert.deepEqual(server.on(1), ['BEGIN', 'INSERT INTO t (id) VALUES (1)', 'INSERT INTO t (id) VALUES (2)']);
+    assert.deepEqual((await where(c)).ids, []);
+
+    // Under the COMMIT itself the outcome is unknown, and the error says so
+    // instead of claiming either. The transaction is over all the same.
+    server.dies.clear();
+    server.dies.add('COMMIT');
+    await c.query('BEGIN');
+    await insert(c, 5);
+    const unknown = await c.query('COMMIT').catch((e) => e);
+    assert.ok(isTransport(unknown), String(unknown));
+    assert.match(unknown.message, /^connection lost under COMMIT: it is not known whether the transaction was committed \(connection (closed|lost.*)\)$/);
+    assert.ok(diedInFlight(unknown.cause), String(unknown.cause));
+    assert.equal(server.log.filter((l) => /COMMIT/.test(l)).length, 1);        // sent once, never again
+    server.dies.clear();
+    assert.equal((await where(c)).txn, false);                                  // re-dialled: the note is gone
+
+    // Under the ROLLBACK itself: the connection error, and the transaction is over.
+    server.dies.add('ROLLBACK');
+    await c.query('BEGIN');
+    await insert(c, 6);
+    assert.ok(diedInFlight(await c.query('ROLLBACK').catch((e) => e)));
+    server.dies.clear();
+    assert.deepEqual(await where(c), { db: 'default', consistency: null, txn: false, ids: [] });
+    await c.end();
+  });
+});
+
+test('a hand-written transaction with no loss behaves as it always did, and what the server answers decides when it is open', async () => {
+  await withSession(async (server, srv) => {
+    const c = await connected(srv);
+    // BEGIN, INSERT, COMMIT: sent as written, on one connection.
+    await c.query('BEGIN');
+    await insert(c, 1);
+    assert.equal((await where(c)).txn, true);
+    assert.deepEqual(await c.query('COMMIT'), DDL);
+    assert.deepEqual(await where(c), { db: 'default', consistency: null, txn: false, ids: [1] });
+    assert.deepEqual(server.on(1), ['BEGIN', 'INSERT INTO t (id) VALUES (1)', 'SELECT count(*) FROM notes', 'COMMIT', 'SELECT count(*) FROM notes']);
+    // Committed, the transaction is over: a loss now is any lost connection.
+    await lose(c, srv);
+    await insert(c, 2);
+    assert.deepEqual((await where(c)).ids, [1, 2]);
+
+    // A COMMIT the server refuses has ended the transaction too …
+    server.refuse.set('COMMIT', 'transaction conflict: a row of table t was changed by another writer');
+    await c.query('begin transaction;');
+    await assert.rejects(c.query('COMMIT'), /transaction conflict/);
+    server.refuse.clear();
+    await lose(c, srv);
+    await insert(c, 3);                                    // … so this re-dials and runs
+    // … and so has a ROLLBACK, whatever it is answered.
+    server.refuse.set('ROLLBACK', 'no transaction in progress');
+    await collect(c.stream('BEGIN -- through stream()'));
+    await assert.rejects(c.query('ROLLBACK'), /no transaction in progress/);
+    server.refuse.clear();
+    await c.query('ROLLBACK');
+    await lose(c, srv);
+    await insert(c, 4);
+    // A BEGIN the server refused opened nothing.
+    server.refuse.set('BEGIN ATOMIC', 'unsupported: BEGIN ATOMIC PARTITION is a cluster statement');
+    await assert.rejects(c.query('BEGIN ATOMIC'), /unsupported/);
+    server.refuse.clear();
+    await lose(c, srv);
+    await insert(c, 5);
+    assert.deepEqual((await where(c)).ids, [1, 2, 3, 4, 5]);
+
+    // Open, every way a statement leaves the client fails once the
+    // connection is gone — a BEGIN and a USE included — and so does a
+    // connect() by hand: only COMMIT or ROLLBACK ends it.
+    for (const begin of ['BEGIN', 'Begin Transaction', 'BEGIN ATOMIC PARTITION (tenant = \'a;b\')', '-- open\nbegin']) {
+      await c.query(begin);
+      await insert(c, 9);
+      await lose(c, srv);
+      const sent = server.log.length;
+      const ways = [() => insert(c, 9), () => c.query('INSERT INTO t (id) VALUES ($1)', [9]),
+        () => c.batch('INSERT INTO t (id) VALUES ($1)', [[9]]), () => collect(c.stream('INSERT INTO t (id) VALUES (9)')),
+        () => c.query('SELECT 1'), () => c.query('USE other'), () => c.query('BEGIN'), () => collect(c.stream('BEGIN')),
+        () => c.query('SET SCAN BUDGET ROWS 1'), () => c.transaction(async () => 'ran')];
+      for (const [i, way] of ways.entries()) assert.ok(isLost(await way().catch((e) => e)), `${begin}, way ${i}`);
+      await c.connect();                                    // a new connection, by the application's own hand
+      assert.equal(c.isUsable(), true);
+      assert.ok(isLost(await insert(c, 9).catch((e) => e)), begin);
+      assert.equal(server.log.length, sent, begin);         // nothing of all that was sent anywhere
+      assert.deepEqual(await collect(c.stream('ROLLBACK')), [], begin);
+      assert.equal(server.log.length, sent, begin);
+      assert.deepEqual(await where(c), { db: 'default', consistency: null, txn: false, ids: [1, 2, 3, 4, 5] }, begin);
+    }
+    await c.end();
+  });
+});
+
+test('transaction() does not note its own BEGIN, and a hand-written transaction ended on a lost connection re-dials into the session it had', async () => {
+  await withSession(async (server, srv) => {
+    const c = await connected(srv);
+    await c.query('USE app');
+    await c.query('SET CONSISTENCY ALL');
+    // The helper is what it was: its transaction is its own.
+    assert.equal(await c.transaction(async (tx) => { await insert(tx, 1); return 'done'; }), 'done');
+    await lose(c, srv);
+    await insert(c, 2);                                     // no transaction is open: re-dialled
+    await assert.rejects(c.transaction(async (tx) => { await lose(tx, srv); await insert(tx, 3); }), isLost);
+    assert.deepEqual((await where(c)).ids, [1, 2]);         // … and after the helper lost one, too
+    // By hand, lost, ended client-side: the next statement is back in the
+    // database and at the consistency the session had.
+    await c.query('BEGIN');
+    await lose(c, srv);
+    await assert.rejects(c.query('COMMIT'), (e) => e.message === NOT_COMMITTED);
+    server.log.length = 0;
+    assert.deepEqual(await where(c), { db: 'app', consistency: 'ALL', txn: false, ids: [1, 2] });
+    assert.deepEqual(server.log.map((l) => l.replace(/^\d+: /, '')), ['USE "app"', 'SET CONSISTENCY ALL', 'SELECT count(*) FROM notes']);
+    await c.end();
+  });
+});
+
+test('transactionStatement reads a BEGIN, and exactly COMMIT or ROLLBACK', () => {
+  const cases = [
+    ['BEGIN', 'begin'], ['begin;', 'begin'], ['BEGIN TRANSACTION', 'begin'], ['  Begin  Transaction ; ', 'begin'],
+    ['BEGIN ATOMIC', 'begin'], ['BEGIN ATOMIC PARTITION (tenant = 7)', 'begin'],
+    ['BEGIN ATOMIC PARTITION (tenant = \'a;b\')', 'begin'], ['-- open\nBEGIN -- now', 'begin'],
+    ['COMMIT', 'commit'], ['commit;', 'commit'], ['COMMIT TRANSACTION', 'commit'], ['Commit   transaction ;', 'commit'],
+    ['COMMIT -- done', 'commit'],
+    ['ROLLBACK', 'rollback'], ['rollback ;', 'rollback'], ['ROLLBACK TRANSACTION', 'rollback'], ['-- undo\nROLLBACK', 'rollback'],
+    // Not exactly one of them: left alone.
+    ['COMMIT WORK', null], ['COMMIT; BEGIN', null], ['ROLLBACK TO x', null], ['ROLLBACK TRANSACTION now', null],
+    ['BEGINNING', null], ['"BEGIN"', null], ['START TRANSACTION', null], ['-- BEGIN', null], ['SELECT \'BEGIN\'', null],
+    ['BEGIN; INSERT INTO t (id) VALUES (1)', null], ['', null], [null, null], [7, null],
+  ];
+  for (const [sql, want] of cases) assert.equal(I.transactionStatement(sql), want, JSON.stringify(sql));
+});

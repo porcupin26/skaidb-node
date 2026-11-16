@@ -24,6 +24,7 @@ const fake = new FakeServer({
     if (req.op === 2) return F.prepared(0, (req.sql.match(/\?/g) || []).length);
     if (req.op === 5 || req.op === 9) return [F.header(['v']), F.chunk([[1]]), F.end()];
     if (req.op === 3 || req.op === 7) return F.mutation(1);
+    if (/^(begin|commit|rollback)\b/i.test(req.sql)) return F.ddl();
     return /^select/i.test(req.sql) ? F.rows(['v'], [[1]]) : F.mutation(1);
   },
 });

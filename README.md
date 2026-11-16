@@ -305,11 +305,30 @@ Two rules, either way:
   has one running, and it never reconnects mid-transaction: when the
   connection is lost, the statement that finds it gone (the `COMMIT`
   included) fails with `connection lost during a transaction` and nothing
-  more is sent. Hand-written statements have no such guard — one sent
-  after the connection was lost re-dials and runs on its own, outside any
-  transaction.
+  more is sent.
 - **Stop if `BEGIN` fails.** With no transaction open, every statement
   after it autocommits on its own.
+
+A transaction written by hand is guarded the same way. The client notes a
+`BEGIN` the server accepted (`BEGIN`, `BEGIN TRANSACTION`, `BEGIN ATOMIC …`,
+sent as one statement of its own) and the `COMMIT` or `ROLLBACK` that ends
+it. If the connection is lost in between, it is **not replaced**: a new one
+has no transaction open, and the rest of yours would commit statement by
+statement. Instead the statement under which the connection went fails with
+the connection error, and every later one with `connection lost during a
+transaction`, sent nowhere — until you end the transaction, which the
+client then settles itself, the server having dropped the transaction with
+the connection:
+
+- `ROLLBACK` succeeds without being sent;
+- `COMMIT` fails with `connection lost during a transaction: COMMIT was not
+  sent and nothing was committed`.
+
+After either, the next statement re-dials as usual. One case is different:
+when the connection goes while the `COMMIT` itself is in flight, the server
+may have applied it before its answer went missing, and the error says so —
+`connection lost under COMMIT: it is not known whether the transaction was
+committed (…)`, with the connection error as its `cause`.
 
 A [stream](#streaming-large-results--clientstreamsql-values-opts) opened in
 `body` has to be finished or closed before `body` ends — a `for await` loop
@@ -543,8 +562,9 @@ Every error the driver raises is a `SkaidbError` (an `Error` subclass).
   new connection back into the session — the database (the `database`
   option, or the one last entered with a `USE` statement), then the
   `SET CONSISTENCY …` and `SET SCAN BUDGET …` last sent as statements — and
-  clears the prepared-statement cache — except inside
-  `transaction()`, which never reconnects mid-transaction. If the database
+  clears the prepared-statement cache — except while a transaction is open,
+  `transaction()`'s or one opened with a `BEGIN` statement, which is never
+  carried to another connection ([Transactions](#transactions)). If the database
   cannot be entered any more (it was dropped meanwhile) the statement fails
   with the server's error for it and runs nowhere; a `USE` to another
   database is not held back by that and gets the client out. Because the failed
@@ -575,9 +595,12 @@ streaming: …`, `server does not support parameterised streaming (skaidb >=
 $N`, `cannot bind value of type …`, `cannot bind NaN/Infinity`, `cannot bind
 an invalid Date`, `bigint … does not fit a 64-bit integer`, `stream
 abandoned with too much data left to drain`, `not connected: await connect()
-first`, `connection lost during a transaction`, `the transaction body left a
-stream open: …`, `a transaction is already running on this connection`,
-`attempts must be >= 1`.
+first`, `connection lost during a transaction`, `connection lost during a
+transaction: COMMIT was not sent and nothing was committed`, `connection lost
+under COMMIT: it is not known whether the transaction was committed (…)`,
+`the transaction body left a stream open: …`, `a transaction is already
+running on this connection`, `attempts must be >= 1`, `every new connection
+broke during member discovery`.
 
 ## Type mapping
 
