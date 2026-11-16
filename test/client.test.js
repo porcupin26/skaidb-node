@@ -721,6 +721,83 @@ test('a connection the server dropped is re-dialled on the next statement; prepa
   });
 });
 
+// A server that keeps each connection's session database, as the real one
+// does: a new connection is in `default`, `USE <name>` enters a database
+// (refused for a name in `refuse`), and every other statement is recorded in
+// `ran` with the database it ran in and the socket it arrived on.
+function sessionServer() {
+  const ran = [];
+  const refuse = new Set();
+  const used = (sql) => {
+    const m = /^\s*use\s+(?:database\s+)?"?([^";\s]+)"?\s*;?\s*(?:--.*)?$/i.exec(sql);
+    return m ? m[1] : null;
+  };
+  const handle = (req, conn) => {
+    if (conn.db === undefined) { conn.db = 'default'; conn.statements = []; }
+    const record = (sql) => ran.push({ sql, db: conn.db, sock: conn.sock });
+    switch (req.op) {
+      case 1: case 5: {
+        const name = used(req.sql);
+        if (name !== null) {
+          if (refuse.has(name)) return F.error(`database "${name}" does not exist`);
+          conn.db = name;
+          return F.ddl();
+        }
+        record(req.sql);
+        if (req.op === 5) return F.ddl();
+        return /^select/i.test(req.sql) ? F.rows(['db'], [[conn.db]]) : F.mutation(1);
+      }
+      case 2:
+        conn.statements.push(req.sql);
+        return F.prepared(conn.statements.length - 1, (req.sql.match(/\?/g) || []).length);
+      case 3: record(conn.statements[req.id]); return F.mutation(1);
+      default: return undefined;                       // Hello -> Ddl
+    }
+  };
+  return { handle, ran, refuse, where: () => ran.map((r) => `${r.db}: ${r.sql}`) };
+}
+
+// Check E's scenario: the connection is lost while the client is idle, then a
+// count and an insert. Resolves to what the two statements answered.
+async function countThenInsertAfterALoss(c, srv) {
+  srv.closeAll();
+  await until(() => !c.isUsable());
+  const count = await c.query('SELECT count(*) FROM notes');
+  const insert = await c.query('INSERT INTO notes (id) VALUES ($1)', [7]);
+  return [count.rows[0].db, insert.rowCount];
+}
+
+test('the database option is re-entered on a re-dialled connection before anything else is sent', async () => {
+  const session = sessionServer();
+  await withServer({ handle: session.handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret', database: 'app' });
+    await c.connect();
+    assert.equal(c.database, 'app');
+    assert.deepEqual(await countThenInsertAfterALoss(c, srv), ['app', 1]);
+    assert.deepEqual(session.where(), ['app: SELECT count(*) FROM notes', 'app: INSERT INTO notes (id) VALUES (?)']);
+    assert.equal(srv.connections, 2);
+    // On the new connection the USE is the first statement after the Hello.
+    const second = srv.requests.slice(srv.requests.findIndex((q, i) => i > 0 && q.op === 8));
+    assert.deepEqual(second.slice(0, 2).map((q) => q.sql || q.op), [8, 'USE "app"']);
+
+    // The database cannot be entered on the new connection: the statement
+    // fails with that error and runs nowhere, each time, until it can.
+    session.ran.length = 0;
+    session.refuse.add('app');
+    srv.closeAll();
+    await until(() => !c.isUsable());
+    for (let i = 0; i < 2; i++) {
+      await assert.rejects(c.query('INSERT INTO notes (id) VALUES (8)'),
+        (e) => e instanceof SkaidbError && /database "app" does not exist/.test(e.message));
+    }
+    assert.deepEqual(session.where(), []);
+    session.refuse.clear();
+    assert.equal((await c.query('INSERT INTO notes (id) VALUES (8)')).rowCount, 1);
+    assert.deepEqual(session.where(), ['app: INSERT INTO notes (id) VALUES (8)']);
+    await c.end();
+  });
+});
+
 test('a connection reset under a statement rejects it with a SkaidbError, as any lost connection does', async () => {
   // The socket reports a reset as an 'error' (ECONNRESET), not as a close.
   const sent = [];
