@@ -540,6 +540,10 @@ class Client {
    */
   async _connectVia(order) {
     this._connected = null;
+    // A connection this dial replaces — connect() called again on a client
+    // that still has one — is closed, not left open on the server until the
+    // process ends. A statement still waiting for its answer there is told.
+    this._letGo(new SkaidbError('connection closed'));
     let last;
     for (const seed of order) {
       this.host = seed.host;
@@ -559,6 +563,23 @@ class Client {
     }
     throw new SkaidbError(
       `no reachable endpoint in ${order.map((s) => `${s.host}:${s.port}`).join(', ')}: ${last && last.message}`);
+  }
+
+  /**
+   * Let go of the socket, if there is one, and of everything read from it:
+   * it is no longer the client's (its late events are ignored), whoever
+   * waits for a frame from it is rejected with `err`, and it is destroyed.
+   */
+  _letGo(err) {
+    const sock = this._sock;
+    if (sock === null) return;
+    const waiting = this._waiters;
+    this._sock = null;
+    this._buf = Buffer.alloc(0);
+    this._frames = [];
+    this._waiters = [];
+    for (const w of waiting) w.reject(err);
+    sock.destroy();
   }
 
   _connectOne() {

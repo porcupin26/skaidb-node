@@ -936,6 +936,37 @@ test('connect() called again empties the prepared cache: no statement runs under
   });
 });
 
+test('connect() called again closes the connection it replaces', async () => {
+  const handle = (req, conn) => {
+    if (req.op === 1 && req.sql === 'SELECT hangs') return [];           // never answered
+    return req.op === 1 ? F.rows(['v'], [[1]]) : undefined;
+  };
+  await withServer({ handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const first = [...srv.sockets][0];
+    await c.connect();
+    // The server is left with the new connection alone, and end() closes that one.
+    await until(() => srv.sockets.size === 1);
+    assert.equal(srv.connections, 2);
+    assert.equal(srv.sockets.has(first), false);
+    assert.deepEqual((await c.query('SELECT 1')).rows, [{ v: 1 }]);
+    assert.equal(srv.sockets.size, 1);
+    // A statement that was waiting for its answer on the connection given up
+    // is told so: its answer cannot come any more.
+    const waiting = c.query('SELECT hangs');
+    waiting.catch(() => {});
+    await until(() => srv.requests.some((q) => q.sql === 'SELECT hangs'));
+    await c.connect();
+    await assert.rejects(settles(waiting), (e) => e instanceof SkaidbError && e.message === 'connection closed');
+    assert.deepEqual((await c.query('SELECT 1')).rows, [{ v: 1 }]);
+    await until(() => srv.sockets.size === 1);
+    assert.equal(srv.connections, 3);
+    await c.end();
+    await until(() => srv.sockets.size === 0);
+  });
+});
+
 test('a statement the cache did not keep is closed on the connection that prepared it, or not at all', async () => {
   const server = idsPerConnection();
   await withServer({ handle: server.handle }, async (srv) => {

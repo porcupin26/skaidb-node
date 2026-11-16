@@ -55,6 +55,10 @@ version; ignored by servers that predate it) and `USE "<database>"` if
 error (`authentication denied: …`, `server signature mismatch (mutual auth
 failed)`) when the handshake failed.
 
+Called again on a client that still has a connection, it dials a new one
+and closes the one it replaces; a statement that was waiting for its answer
+there rejects with `connection closed`.
+
 ### `client.query(text, values?)` · `client.query(config, values?)`
 
 `config = { text, values?, consistency?, rowMode? }`. `config.values` wins
