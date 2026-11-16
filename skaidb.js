@@ -572,6 +572,12 @@ class Client {
     // live on the connection, so a new one is given them again, after the
     // database and before anything else is sent.
     this._settings = { consistency: null, scanBudget: null };
+    // A re-dial made for a USE statement does not enter the database that
+    // statement leaves (`_leaving`, for the length of that dial). Until the
+    // USE is answered the connection is then `_adrift`: in the server's
+    // default database, not in the one the client holds.
+    this._leaving = false;
+    this._adrift = false;
     this._sock = null;
     this._buf = Buffer.alloc(0);
     this._waiters = [];       // queue of {resolve, reject} awaiting a frame
@@ -814,7 +820,13 @@ class Client {
    */
   async _enterSession() {
     const send = (sql) => this._doQuery(sql, this.consistency, 'object');
-    if (this.database) await send(useStatement(this.database));
+    // Not the database, when the statement this dial is for is a USE: it
+    // says where the session goes, and the database it leaves may be one
+    // that can no longer be entered — dropped while the client was away —
+    // which would fail the dial, and with it the only statement that gets
+    // the client out of there.
+    this._adrift = this._leaving && this.database !== null;
+    if (this.database && !this._leaving) await send(useStatement(this.database));
     if (this._settings.consistency !== null) await send(this._settings.consistency);
     if (this._settings.scanBudget !== null) await send(this._settings.scanBudget);
   }
@@ -931,8 +943,12 @@ class Client {
    * connection that created it, so reusing one after a reconnect would run a
    * different statement (or fail obscurely). Everything else is per-socket
    * scratch state and is reset with it.
+   *
+   * `leaving` says the statement about to be sent is a USE the client can
+   * read: a connection dialled for it is given the session's settings but
+   * not its database (see _enterSession).
    */
-  async _ensureLive() {
+  async _ensureLive(leaving = false) {
     if (this._closed) throw new SkaidbError('connection is closed');
     if (this._reconnecting) return;
     await this._look();
@@ -963,14 +979,30 @@ class Client {
       try { if (this._sock) this._sock.destroy(); } catch (_) { /* already gone */ }
       this._sock = null;
       this._broken = false;
+      this._leaving = leaving;
       if (order !== null) await this._connectVia(order);
-      else await this.connect();     // re-runs seed failover + handshake + USE
+      else await this.connect();     // re-runs seed failover + handshake + the session
     } catch (e) {
       this._broken = true;           // still down; the next call tries again
       throw e;
     } finally {
+      this._leaving = false;
       this._reconnecting = false;
     }
+  }
+
+  /**
+   * The USE a connection was dialled for (see _enterSession) was not
+   * accepted: the connection is in the server's default database, the
+   * client in one it could not re-enter. Nothing may run there, so the
+   * connection is given up — the next statement dials again and goes back
+   * into the client's database, or fails with that database's error, as it
+   * did before the USE was tried.
+   */
+  _driftedOff() {
+    if (!this._adrift) return;
+    this._adrift = false;
+    this._fail(new SkaidbError('connection closed: it was not in the session database'));
   }
 
   /**
@@ -1043,7 +1075,7 @@ class Client {
    */
   _noteSession(sql) {
     const name = usedDatabase(sql);
-    if (name !== null) { this.database = name; return; }
+    if (name !== null) { this.database = name; this._adrift = false; return; }
     const setting = sessionSetting(sql);
     if (setting !== null) this._settings[setting.kind] = setting.text;
   }
@@ -1104,7 +1136,8 @@ class Client {
     const run = this._queryChain.then(async () => {
       // Recover a transport that died since the last statement, BEFORE
       // anything is prepared on it (a stale statement id is the hazard).
-      await this._ensureLive();
+      const leaving = !(params && params.length) && usedDatabase(text) !== null;
+      await this._ensureLive(leaving);
       if (params && params.length) {
         // Server-side prepare so parameters travel as TYPED values; arrays
         // and documents have no SQL literal form. `$N` is rewritten to the
@@ -1124,9 +1157,13 @@ class Client {
         }
       }
       const sent = bindParams(text, params);
-      const res = await this._doQuery(sent, consistency, rowMode);
-      if (res.command === 'DDL') this._noteSession(sent);
-      return res;
+      try {
+        const res = await this._doQuery(sent, consistency, rowMode);
+        if (res.command === 'DDL') this._noteSession(sent);
+        return res;
+      } finally {
+        if (leaving) this._driftedOff();
+      }
     }).then((res) => {
       this._noteStatement(text);
       return res;
@@ -1198,6 +1235,8 @@ class Client {
     // bound (`$3` with two values, a `?`, NaN) rejects without waiting
     // behind other statements or sending anything.
     const request = streamRequest(sql, opts.values || values, consistency);
+    // Sent as text, and a USE the client can read: see _ensureLive.
+    const leaving = request[0] === 5 && usedDatabase(sql) !== null;
     // Hold the query chain for the WHOLE stream rather than per frame, so
     // no other statement can interleave its frames with ours. Concurrency
     // choice: a query()/batch() call made meanwhile QUEUES behind the stream
@@ -1225,7 +1264,7 @@ class Client {
       // Re-dial a transport that died since the last statement, exactly as
       // query() does. Without this the request goes into a dead socket and
       // the reply never comes.
-      await this._ensureLive();
+      await this._ensureLive(leaving);
       // This stream now owns the result slots: nothing stale from the
       // previous stream may describe it (a mutation has no columns).
       this.stream.columns = null;
@@ -1333,6 +1372,7 @@ class Client {
           }
         } catch { /* connection is gone; nothing to drain */ }
       }
+      if (leaving) this._driftedOff();
       done();
     }
   }

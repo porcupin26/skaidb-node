@@ -268,3 +268,76 @@ test('sessionSetting reads exactly one SET CONSISTENCY or SET SCAN BUDGET statem
   ];
   for (const [sql, want] of cases) assert.deepEqual(I.sessionSetting(sql), want, JSON.stringify(sql));
 });
+
+// ---- K: a USE is never held hostage by the database it leaves ---------------
+
+test('a USE that re-dials goes out without re-entering the database it leaves, so a dropped database cannot hold the client', async () => {
+  await withSession(async (server, srv) => {
+    const gone = (name) => isStatementError(`database "${name}" does not exist`);
+    const c = await connected(srv);
+    await c.query('USE app');
+    await c.query('SET CONSISTENCY ALL');
+    server.gone.add('app');                               // dropped from another connection
+    await lose(c, srv);
+    // Any other statement fails with the USE's error, and runs nowhere: it
+    // must not run in another database.
+    await assert.rejects(c.query('SELECT 1'), gone('app'));
+    await assert.rejects(c.query('INSERT INTO notes (id) VALUES (1)'), gone('app'));
+    assert.deepEqual(server.on(2).concat(server.on(3)), ['USE "app"', 'USE "app"']);
+    // A USE gets out: the new connection is given the settings, not the old database.
+    await c.query('USE other');
+    assert.deepEqual(server.on(4), ['SET CONSISTENCY ALL', 'USE other']);
+    assert.equal(c.database, 'other');
+    assert.deepEqual(await where(c), { db: 'other', consistency: 'ALL', txn: false, ids: [] });
+    // … and other is where a later re-dial goes back to.
+    await lose(c, srv);
+    assert.deepEqual(await where(c), { db: 'other', consistency: 'ALL', txn: false, ids: [] });
+    assert.deepEqual(server.on(5), ['USE "other"', 'SET CONSISTENCY ALL', 'SELECT count(*) FROM notes']);
+
+    // Every form the client reads as a USE, through query() and stream().
+    const forms = [(x) => x.query('use database app2;'), (x) => x.query('  USE "app2" -- back'),
+      (x) => x.query({ text: 'USE app2' }), (x) => collect(x.stream('USE app2'))];
+    for (const [i, use] of forms.entries()) {
+      await c.query('USE other');
+      server.gone.add('other');
+      await lose(c, srv);
+      server.log.length = 0;
+      await use(c);
+      assert.ok(!server.log.some((l) => /USE "other"/.test(l)), `form ${i}: ${server.log}`);
+      assert.equal((await where(c)).db, 'app2', `form ${i}`);
+      server.gone.delete('other');
+    }
+
+    // A USE the server refuses there leaves the client where it was — in a
+    // database it cannot enter — and not in the new connection's default
+    // one: the next statement fails as before, and still runs nowhere.
+    await c.query('USE other');
+    server.gone.add('other').add('nope');
+    await lose(c, srv);
+    server.log.length = 0;
+    await assert.rejects(c.query('USE nope'), gone('nope'));
+    await assert.rejects(collect(c.stream('USE nope')), gone('nope'));
+    assert.equal(c.database, 'other');
+    await assert.rejects(where(c), gone('other'));
+    await assert.rejects(c.query('INSERT INTO notes (id) VALUES (2)'), gone('other'));
+    assert.ok(!server.log.some((l) => /SELECT|INSERT/.test(l)), String(server.log));
+    assert.deepEqual([...server.ids], []);
+    // The database is there again: the client is back in it.
+    server.gone.delete('other');
+    assert.equal((await where(c)).db, 'other');
+    await c.end();
+
+    // Inside transaction() nothing changes: a lost connection is a lost
+    // transaction for a USE too.
+    const t = await connected(srv, { database: 'app2' });
+    let caught;
+    await assert.rejects(t.transaction(async (tx) => {
+      await lose(tx, srv);
+      caught = await tx.query('USE other').catch((e) => e);
+      throw caught;
+    }), /connection lost during a transaction/);
+    assert.equal(t.database, 'app2');
+    assert.equal((await where(t)).db, 'app2');
+    await t.end();
+  });
+});

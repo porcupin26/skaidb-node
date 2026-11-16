@@ -341,6 +341,14 @@ the new connection, the statement rejects with the server's error for the
 `USE` (`database "app" does not exist`), a statement error like any other,
 and is not sent: it never runs in another database.
 
+A `USE` is how the client gets out of such a database. When the statement
+that re-dials is itself a `USE` the client can read, the new connection is
+not put into the old database first — only the session's settings are sent
+— and the `USE`'s own answer decides where the session is. If the server
+refuses that `USE` too, the client stays where it was: the connection,
+which is in neither database, is given up, and the next statement dials
+again and fails as before.
+
 So do the session's settings. `SET CONSISTENCY { ONE | QUORUM | ALL }` (an
 override for every statement on the connection) and `SET SCAN BUDGET ROWS
 <n> [BYTES <n>]` are state of the connection too, and a new one has
