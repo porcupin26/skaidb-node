@@ -531,6 +531,9 @@ class Client {
    * that accepts TCP while unhealthy must not swallow the attempt.
    */
   connect() {
+    // end() is terminal: there is nothing to dial for, and a connection made
+    // now could not be used.
+    if (this._closed) return Promise.reject(new SkaidbError('connection is closed'));
     // One dial at a time: a call made while one is running gets that dial's
     // outcome. Two of them would share the client's handshake state — each
     // login reading the other's frames — and leave both sockets open.

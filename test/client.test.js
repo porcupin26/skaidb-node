@@ -1310,6 +1310,11 @@ test('a closed client rejects every statement with "connection is closed", a clo
     const never = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
     await never.end();
     await rejectsEverywhere(never, 'connection is closed', 'closed before connecting');
+    // end() is terminal for connect() too: it says so, and dials nothing.
+    for (const closed of [c, never]) {
+      await assert.rejects(closed.connect(), (e) => e instanceof SkaidbError && e.message === 'connection is closed');
+      assert.equal(closed.isUsable(), false);
+    }
     assert.equal(srv.requests.length, sent);                   // nothing reached the server
     assert.equal(srv.connections, 1);
 
