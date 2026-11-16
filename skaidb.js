@@ -27,6 +27,11 @@ const PREPARED_CACHE_MAX = 240;
 // full: "too many prepared statements (max 256); close some first".
 const STATEMENT_TABLE_FULL = 'too many prepared statements';
 
+// What a stream throws when it is resumed after transaction() closed the
+// connection under it (its body left the stream open).
+const STREAM_DROPPED = 'stream abandoned: the transaction that opened it ended while it was open, '
+  + 'and its connection was closed';
+
 // How much of an abandoned stream is worth reading out before dropping the
 // connection instead. The server sends ~256 KB row chunks, so this is a few
 // dozen of them: past that, transferring the remainder of a large scan costs
@@ -438,6 +443,10 @@ class Client {
     // answered, 'open' from then until the transaction ends, else null.
     this._txn = null;
     this._txnRollbackFailed = false;   // the last transaction()'s clean-up ROLLBACK did not go through
+    // Streams that hold this connection or wait for it, each as {release,
+    // dropped} (see stream()): transaction() takes the connection back from
+    // the ones its body left open.
+    this._streams = new Set();
     this._connected = null;    // 'host:port' reached by the last successful dial
     // The pool that owns this client (see Pool): told each round trip's
     // latency, each transport failure and each write, and asked for the dial
@@ -897,10 +906,19 @@ class Client {
     let release;
     let streaming = false;      // a header arrived: frames are still coming
     const held = new Promise((r) => { release = r; });
+    // What transaction() needs to take the connection back from a stream its
+    // body left open: `release` lets the queue move on, and `dropped` tells
+    // this generator, if it is ever resumed, that the connection is no longer
+    // its to read — by then it may be a new one, carrying another
+    // statement's reply.
+    const me = { release, dropped: false };
+    const done = () => { this._streams.delete(me); release(); };
     const prev = this._queryChain;
     this._queryChain = held;
+    this._streams.add(me);
     await prev;
     try {
+      if (me.dropped) throw new SkaidbError(STREAM_DROPPED);
       // Re-dial a transport that died since the last statement, exactly as
       // query() does. Without this the request goes into a dead socket and
       // the reply never comes.
@@ -940,7 +958,7 @@ class Client {
         this.stream.command = 'CALL';
         this.stream.columns = res.columns;
         this.stream.resultSets = res.resultSets;
-        release();
+        done();
         for (const row of res.rows) yield row;
         return;
       }
@@ -952,6 +970,7 @@ class Client {
       this.stream.columns = fields;
       this.stream.command = 'SELECT';
       for (;;) {
+        if (me.dropped) throw new SkaidbError(STREAM_DROPPED);
         const r = new Reader(await this._readFrame());
         const t = r.u8();
         if (t === 6) {
@@ -966,6 +985,7 @@ class Client {
               for (let c = 0; c < fields.length; c++) o[fields[c]] = cells[c];
               yield o;
             }
+            if (me.dropped) throw new SkaidbError(STREAM_DROPPED);
           }
         } else if (t === 7) {
           streaming = false;
@@ -982,8 +1002,9 @@ class Client {
       // Abandoned early (a `break`, a throw): the server is still sending.
       // Drain to RowsEnd, or the leftovers would be read as the reply to the
       // NEXT statement on this connection. A broken connection has nothing
-      // to drain and nothing left to desync, so it is skipped.
-      if (streaming && !this._closed && !this._broken) {
+      // to drain and nothing left to desync, so it is skipped; so is a
+      // connection that was taken from this stream.
+      if (streaming && !me.dropped && !this._closed && !this._broken) {
         try {
           let budget = DRAIN_BUDGET_BYTES;
           for (;;) {
@@ -1005,7 +1026,7 @@ class Client {
           }
         } catch { /* connection is gone; nothing to drain */ }
       }
-      release();
+      done();
     }
   }
 
@@ -1085,7 +1106,12 @@ class Client {
    *
    * A connection lost while the transaction is open is not re-dialled: the
    * statement that finds it gone, the COMMIT included, fails with
-   * `connection lost during a transaction` and nothing more is sent. Nothing
+   * `connection lost during a transaction` and nothing more is sent. A
+   * stream the body opened must be finished or closed when the body ends:
+   * one left open holds the connection, so instead of a COMMIT or ROLLBACK
+   * that would wait behind it for good the connection is closed (the server
+   * drops the transaction with it) and the body's error, or one saying the
+   * stream was left open, is thrown. Nothing
    * else may use this client meanwhile — its statements would join the
    * transaction — and a second transaction() on it is refused until the
    * first has ended. `attempts` below 1 is refused before anything is sent.
@@ -1103,11 +1129,18 @@ class Client {
         try {
           value = await body(this);
         } catch (e) {
+          // A stream the body left open: no ROLLBACK can be sent, and
+          // closing the connection is what rolls back.
+          if (await this._dropOpenStreams()) throw e;
           // The clean-up never replaces the error it cleans up after: a
           // ROLLBACK with nothing open is itself an Error on servers before
           // 0.347, and on a lost connection it is not sent at all.
           try { await this.query('ROLLBACK'); } catch (_) { this._txnRollbackFailed = true; }
           throw e;
+        }
+        if (await this._dropOpenStreams()) {
+          throw new SkaidbError('the transaction body left a stream open: COMMIT was not sent and the '
+            + 'connection was closed (finish or close every stream inside the body)');
         }
         try {
           await this.query('COMMIT');
@@ -1120,6 +1153,25 @@ class Client {
         this._txn = null;
       }
     }
+  }
+
+  /**
+   * transaction(), its body done: a stream the body left open still holds
+   * this connection, and the COMMIT or ROLLBACK would wait behind it for
+   * good — an iterator nobody closes is closed by nobody — with the
+   * transaction open on the server all the while. The connection is closed
+   * instead, which is what makes the server drop the transaction: the
+   * streams are told they lost it, and whatever was queued behind them
+   * fails here, still inside the lost transaction, instead of running on
+   * the next connection. Resolves to whether there was such a stream.
+   */
+  async _dropOpenStreams() {
+    if (this._streams.size === 0) return false;
+    this._fail(new SkaidbError('connection closed: a transaction ended with a stream still open'));
+    for (const s of this._streams) { s.dropped = true; s.release(); }
+    this._streams.clear();
+    await this._queryChain;
+    return true;
   }
 
   /**

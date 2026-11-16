@@ -309,6 +309,14 @@ Two rules, either way:
 - **Stop if `BEGIN` fails.** With no transaction open, every statement
   after it autocommits on its own.
 
+A [stream](#streaming-large-results--clientstreamsql-values-opts) opened in
+`body` has to be finished or closed before `body` ends — a `for await` loop
+does that on every way out. One left open would keep the `COMMIT` or
+`ROLLBACK` waiting behind it, so `transaction()` closes the connection
+instead, which makes the server drop the transaction, and rejects: with
+`body`'s own error if it threw, otherwise with `the transaction body left a
+stream open: …`. The next statement reconnects.
+
 `batch()` is not a transaction: its rows autocommit one by one, as
 described above.
 

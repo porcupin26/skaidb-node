@@ -169,6 +169,18 @@ connection dies rejects with the usual `connection lost` / `connection
 closed`. Neither is retried. If the connection dies while the `COMMIT` is in
 flight, the client cannot know whether it was applied.
 
+A stream opened in `body` must be finished or closed before `body` returns
+or throws; a `for await` loop does so on every way out. If one is still
+open then — it holds the connection, so the `COMMIT` or `ROLLBACK` could
+only wait behind it — the client closes the connection instead, which makes
+the server drop the transaction, and `transaction()` rejects: with `body`'s
+own error if it threw, otherwise with `the transaction body left a stream
+open: COMMIT was not sent and the connection was closed (finish or close
+every stream inside the body)`. It is not retried. The stream rejects if it
+is resumed, a statement that was queued behind it rejects with `connection
+lost during a transaction`, and the next statement
+[reconnects](#reconnect).
+
 The transaction is the connection's: every statement sent on this client
 until it ends is part of it, whoever sends it. A second `transaction()` on a
 client that has one running — from inside `body` too — rejects with `a

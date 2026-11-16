@@ -265,7 +265,10 @@ export class Client {
    * the whole transaction again, at once, up to `opts.attempts` runs in
    * all, so the body must be safe to run more than once; any other `COMMIT`
    * error is thrown as it is. A connection lost while the transaction is
-   * open is not re-dialled. Nothing else may use the client meanwhile.
+   * open is not re-dialled. A stream the body opens must be finished or
+   * closed before the body ends: one left open gets the connection closed
+   * (which rolls back) and the call rejected. Nothing else may use the
+   * client meanwhile.
    */
   transaction<T>(body: (client: Client) => Promise<T> | T, opts?: TransactionOptions): Promise<T>;
 

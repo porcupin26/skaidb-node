@@ -514,6 +514,131 @@ test('transaction: the opening statement re-dials a connection lost while the cl
   });
 });
 
+// `promise`, or a rejection when it has not settled within `ms`: a call that
+// hangs must fail its test, not stall the suite.
+const settles = (promise, ms = 1500) => {
+  let timer;
+  const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`still pending after ${ms} ms`)), ms); });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+};
+
+// A recorder that also serves OP_QUERY_STREAM: `SELECT id FROM big` streams
+// three rows in two chunks, anything else answers Ddl. A stream is recorded
+// as `stream: <sql>`.
+function streamRecorder(answers = {}) {
+  const rec = recorder(answers);
+  const handle = (req, conn) => {
+    if (req.op !== 5) return rec.handle(req, conn);
+    rec.seen.push({ sql: `stream: ${req.sql}`, sock: conn.sock });
+    return req.sql === 'SELECT id FROM big'
+      ? [F.header(['id']), F.chunk([[1], [2]]), F.chunk([[3]]), F.end()] : F.ddl();
+  };
+  return { ...rec, handle };
+}
+
+test('transaction: a stream the body left open ends the transaction with an error and closes the connection, instead of the COMMIT or ROLLBACK waiting behind it', async () => {
+  const rec = streamRecorder();
+  const srv = await new FakeServer({ handle: rec.handle }).start();
+  try {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const mine = new Error('mine');
+
+    // The body throws with a stream open: its own error, and the connection is gone.
+    let left;
+    await assert.rejects(settles(c.transaction(async (tx) => {
+      await tx.query('UPDATE a SET v = 1');
+      left = tx.stream('SELECT id FROM big');
+      assert.deepEqual((await left.next()).value, { id: 1 });
+      throw mine;
+    })), (e) => e === mine);
+    assert.equal(c.isUsable(), false);
+    await until(() => srv.sockets.size === 0);           // closed: the server drops the transaction with it
+    assert.deepEqual(rec.sqls(), ['BEGIN', 'UPDATE a SET v = 1', 'stream: SELECT id FROM big']);
+    // The next statement is not waiting behind the stream, and not inside its transaction: a new connection.
+    assert.equal((await settles(c.query('SELECT 1'))).command, 'DDL');
+    assert.equal(srv.connections, 2);
+    assert.notEqual(rec.seen[3].sock, rec.seen[0].sock);
+    // The stream, if it is ever resumed, fails; it does not read the new connection's replies.
+    await assert.rejects(settles(collect(left)), isTransport);
+    assert.equal((await settles(c.query('SELECT 2'))).command, 'DDL');
+    assert.equal(c.isUsable(), true);
+    assert.equal(srv.connections, 2);
+
+    // The body returns with a stream open: an error all the same, and no COMMIT.
+    rec.seen.length = 0;
+    let runs = 0;
+    await assert.rejects(settles(c.transaction(async (tx) => {
+      runs++;
+      left = tx.stream('SELECT id FROM big');
+      await left.next();
+      return 'the body returned';
+    })), (e) => isTransport(e) && /left a stream open/.test(e.message));
+    assert.equal(runs, 1);                               // not retried
+    assert.deepEqual(rec.sqls(), ['BEGIN', 'stream: SELECT id FROM big']);
+    await until(() => srv.sockets.size === 0);
+    await assert.rejects(settles(left.next()), isTransport);
+
+    // A statement the body queued behind its open stream goes nowhere either.
+    rec.seen.length = 0;
+    let queued;
+    await assert.rejects(settles(c.transaction(async (tx) => {
+      left = tx.stream('SELECT id FROM big');
+      await left.next();
+      queued = tx.query('INSERT INTO c VALUES (3)');     // not awaited: waits behind the stream
+      queued.catch(() => {});
+      throw mine;
+    })), (e) => e === mine);
+    await assert.rejects(settles(queued), lostInTransaction);
+    assert.deepEqual(rec.sqls(), ['BEGIN', 'stream: SELECT id FROM big']);
+    await left.return();
+
+    // A stream the body finished, closed early or never started holds nothing: COMMIT as usual.
+    rec.seen.length = 0;
+    assert.equal(await settles(c.transaction(async (tx) => {
+      const all = await collect(tx.stream('SELECT id FROM big'));
+      for await (const row of tx.stream('SELECT id FROM big')) { if (row.id === 1) break; }
+      tx.stream('SELECT id FROM big');                   // never iterated: nothing was sent
+      return all.length;
+    })), 3);
+    assert.deepEqual(rec.sqls(), ['BEGIN', 'stream: SELECT id FROM big', 'stream: SELECT id FROM big', 'COMMIT']);
+    assert.equal(rec.sockets(), 1);
+    assert.equal(c.isUsable(), true);
+    await c.end();
+  } finally {
+    await srv.stop();
+  }
+});
+
+test('Pool.transaction: a connection whose body left a stream open is closed, not pooled', async () => {
+  const rec = streamRecorder();
+  const srv = await new FakeServer({ handle: rec.handle }).start();
+  const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+  try {
+    const mine = new Error('mine');
+    let first;
+    await assert.rejects(settles(pool.transaction(async (tx) => {
+      first = tx;
+      await tx.stream('SELECT id FROM big').next();
+      throw mine;
+    })), (e) => e === mine);
+    assert.deepEqual([pool.members()[0].inUse, pool.members()[0].idle], [0, 0]);
+    assert.equal(first.isUsable(), false);
+    await until(() => srv.sockets.size === 0);
+    assert.equal(pool._members.get(pool.members()[0].endpoint).errors, 0);   // not the member's fault
+    // The next transaction gets a connection of its own and runs whole on it.
+    rec.seen.length = 0;
+    const second = await settles(pool.transaction(async (tx) => { await tx.query('UPDATE a SET v = 1'); return tx; }));
+    assert.notEqual(second, first);
+    assert.deepEqual(rec.sqls(), ['BEGIN', 'UPDATE a SET v = 1', 'COMMIT']);
+    assert.equal(srv.connections, 2);
+    assert.deepEqual([pool.members()[0].inUse, pool.members()[0].idle], [0, 1]);
+  } finally {
+    await pool.end();
+    await srv.stop();
+  }
+});
+
 test('transaction: a connection that breaks inside a transaction closes its socket at once, not at the next statement or at end()', async () => {
   // A frame that cannot be placed (a protocol desync) and the one client-side
   // timeout the driver has, the pool's bound on its own statements: each marks
