@@ -399,6 +399,84 @@ test('transaction: a connection that dies under a statement is the usual connect
   }
 });
 
+// A transport failure as the driver reports one: a SkaidbError the server
+// did not answer with (a statement error is never a member's fault).
+const isTransport = (e) => e instanceof SkaidbError && !(e instanceof TransactionConflictError) && I.memberFault(e);
+const lostInTransaction = (e) => isTransport(e) && e.message === 'connection lost during a transaction';
+
+test('transaction: after the connection is lost, a body that catches the error and goes on sends nothing more — not its next write, not the COMMIT', async () => {
+  // PROTOCOL.md section 6 rule 7: no statement of the body leaves the
+  // transaction's session. Lost between statements, noticed before the next.
+  await withClient({}, async (c, rec, srv) => {
+    const caught = [];
+    const out = await c.transaction(async (tx) => {
+      await tx.query('UPDATE a SET v = 1');                                           // statement 1
+      srv.closeAll();                                                                 // the node restarts
+      await until(() => !c.isUsable());
+      caught.push(await tx.query('UPDATE b SET v = 1').catch((e) => e));              // statement 2, caught
+      caught.push(await tx.query('INSERT INTO c VALUES (3)').catch((e) => e));        // statement 3, a write
+      caught.push(await tx.query('INSERT INTO c VALUES ($1)', [4]).catch((e) => e));  // … with values
+      caught.push(await tx.batch('INSERT INTO c VALUES ($1)', [[5]]).catch((e) => e));
+      caught.push(await collect(tx.stream('INSERT INTO c VALUES (6)')).catch((e) => e));
+      return 'the body returned';
+    }).catch((e) => e);
+    assert.equal(caught.length, 5);
+    for (const e of caught) assert.ok(lostInTransaction(e), String(e));
+    assert.ok(lostInTransaction(out), String(out));     // the loss, although the body returned normally
+    // Nothing after statement 1 went anywhere: no write, no COMMIT, no ROLLBACK, no new connection.
+    assert.deepEqual(rec.sqls(), ['BEGIN', 'UPDATE a SET v = 1']);
+    assert.deepEqual(srv.requests.filter((q) => q.op !== 8).map((q) => q.op), [1, 1]);
+    assert.equal(srv.connections, 1);
+    // The transaction over, the client is what it is after any lost connection: the next statement re-dials.
+    assert.equal(c.isUsable(), false);
+    assert.equal((await c.query('SELECT 1')).command, 'DDL');
+    assert.equal(c.isUsable(), true);
+    assert.equal(srv.connections, 2);
+    assert.deepEqual(rec.sqls(), ['BEGIN', 'UPDATE a SET v = 1', 'SELECT 1']);
+  });
+
+  // Lost under statement 2 itself, and under the COMMIT itself.
+  for (const dies of ['UPDATE b SET v = 1', 'COMMIT']) {
+    const rec = recorder();
+    const handle = (req, conn) => {
+      const answer = rec.handle(req, conn);
+      if (req.op === 1 && req.sql === dies) { conn.sock.destroy(); return []; }
+      return answer;
+    };
+    const srv = await new FakeServer({ handle }).start();
+    try {
+      const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+      await c.connect();
+      const caught = [];
+      const out = await c.transaction(async (tx) => {
+        await tx.query('UPDATE a SET v = 1');
+        if (dies !== 'COMMIT') {
+          caught.push(await tx.query(dies).catch((e) => e));
+          caught.push(await tx.query('INSERT INTO c VALUES (3)').catch((e) => e));
+        }
+        return 'the body returned';
+      }).catch((e) => e);
+      if (dies === 'COMMIT') {
+        // In flight when the connection went: the usual connection error, which
+        // does not say whether the COMMIT was applied. Not sent again, no ROLLBACK.
+        assert.ok(isTransport(out) && /^connection (closed|lost)$/.test(out.message), String(out));
+        assert.deepEqual(rec.sqls(), ['BEGIN', 'UPDATE a SET v = 1', 'COMMIT']);
+      } else {
+        assert.ok(isTransport(caught[0]) && /^connection (closed|lost)$/.test(caught[0].message), String(caught[0]));
+        assert.ok(lostInTransaction(caught[1]), String(caught[1]));
+        assert.ok(lostInTransaction(out), String(out));
+        assert.deepEqual(rec.sqls(), ['BEGIN', 'UPDATE a SET v = 1', 'UPDATE b SET v = 1']);
+      }
+      assert.equal(srv.connections, 1);
+      assert.equal((await c.query('SELECT 1')).command, 'DDL');         // usable again, on a new connection
+      assert.equal(srv.connections, 2);
+      await c.end();
+    } finally {
+      await srv.stop();
+    }
+  }
+});
+
 // ---- the pool ---------------------------------------------------------------
 
 // Runs `fn(pool, rec, srv)` with a pool over one fake member.
