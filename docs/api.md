@@ -51,9 +51,13 @@ Shuffles the seeds and tries each until one connects and authenticates.
 Then sends the Hello frame (driver name `nodejs`, version = the package
 version; ignored by servers that predate it) and `USE "<database>"` if
 `database` was given. Rejects with `SkaidbError('no reachable endpoint in
-<seeds>: <last error>')` when every seed failed, or with the authentication
-error (`authentication denied: …`, `server signature mismatch (mutual auth
-failed)`) when the handshake failed.
+<seeds>: <last error>')` when every seed failed; the last error is the
+connection's (`connect failed: …`, `connect timeout`) or the handshake's
+(`authentication denied: …`, `server signature mismatch (mutual auth
+failed)`). When a seed was reached and logged in to, and then refused the
+session — the `database` does not exist there — `connect()` rejects with
+that statement error itself, the server's message unchanged: the endpoint
+was reachable, and what it answered is the reason.
 
 Called again on a client that still has a connection, it dials a new one
 and closes the one it replaces; a statement that was waiting for its answer
@@ -320,8 +324,9 @@ accepted is noted when it goes through `query()` or `stream()` as one
 statement of its own — the name bare or in double quotes, an optional
 trailing `;`; text the client cannot read as exactly that is left alone, and
 `client.database` says what it holds. If the database cannot be entered on
-the new connection, the statement rejects with `no reachable endpoint in …:
-<the server's error>` and is not sent: it never runs in another database.
+the new connection, the statement rejects with the server's error for the
+`USE` (`database "app" does not exist`), a statement error like any other,
+and is not sent: it never runs in another database.
 
 ## `new Pool(options?)`
 
@@ -346,7 +351,7 @@ An unknown `loadBalancing` or `idleOrder`, `maxsize < 1` or
 
 | Member | Meaning |
 |---|---|
-| `pool.acquire(options?): Promise<Client>` | An idle connection to the member the policy picks, validated with `isUsable()` (a dead one is discarded and the next tried), or one freshly dialed to it — a failed dial falls through to the other usable members, then to the unusable ones. `options.affinity` (any value; a user or session id) scopes `readYourWrites`; without it checkouts share one pool-wide key. Rejects with `pool is closed` after `end()`, and with `no reachable endpoint in …` when no member can be dialed. |
+| `pool.acquire(options?): Promise<Client>` | An idle connection to the member the policy picks, validated with `isUsable()` (a dead one is discarded and the next tried), or one freshly dialed to it — a failed dial falls through to the other usable members, then to the unusable ones. `options.affinity` (any value; a user or session id) scopes `readYourWrites`; without it checkouts share one pool-wide key. Rejects with `pool is closed` after `end()`, with `no reachable endpoint in …` when no member can be dialed, and with the server's own error when a member was reached and refused the session (the pool's `database` does not exist). |
 | `pool.release(conn): Promise<void>` | Returns a connection; closes it instead when it is broken, its member is ejected, not `ready` or gone, the pool is closed, `maxsize` idle connections already exist, or a `transaction()` may still be open on it (one still running, or one whose `ROLLBACK` failed). A connection its borrower moved to another database with `USE` is first put back into the pool's `database` (and closed if that fails), so the next borrower starts there; a pool without a `database` option leaves the connection where its borrower left it. |
 | `pool.withConnection(fn)` · `pool.withConnection(options, fn)`: `Promise<T>` | `acquire(options)`, run `fn(conn)`, `release()` however `fn` ends. |
 | `pool.transaction(body, opts?): Promise<T>` | [`client.transaction(body, opts)`](#clienttransactionbody-opts-promiset) on one checked-out connection: checked out once, held for every statement and every run, released however it ends. `body` gets that connection. `opts = { attempts?, begin?, affinity? }`, `affinity` as in `acquire()`. Bad arguments reject before a connection is checked out. |

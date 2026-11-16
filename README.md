@@ -97,7 +97,9 @@ skaidb is leaderless: every node accepts reads and writes, so a seed list is
 only "somewhere to land". `connect()` shuffles the seeds and tries them in
 turn until one **connects and authenticates** (a node that accepts TCP while
 unhealthy does not swallow the attempt). If none works it throws
-`no reachable endpoint in <list>: <last error>`. Bare hosts take `port`.
+`no reachable endpoint in <list>: <last error>` — unless a node was reached
+and refused the session (the `database` to enter does not exist): then the
+error is that node's answer, as the server gave it. Bare hosts take `port`.
 
 The same walk runs again on reconnect (below), so a client survives the node
 it was talking to going away. A pooled connection re-dials in the pool's

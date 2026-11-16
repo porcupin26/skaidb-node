@@ -557,6 +557,7 @@ class Client {
     // process ends. A statement still waiting for its answer there is told.
     this._letGo(new SkaidbError('connection closed'));
     let last;
+    let refused = null;
     for (const seed of order) {
       this.host = seed.host;
       this.port = seed.port;
@@ -570,6 +571,7 @@ class Client {
         return;
       } catch (e) {
         last = e;
+        if (statementErrors.has(e)) refused = e;
         if (this._pool !== null && memberFault(e)) this._pool._failed(`${seed.host}:${seed.port}`);
       }
     }
@@ -580,6 +582,11 @@ class Client {
     // that was lost and dial by itself. (A statement's own re-dial that
     // fails says so itself and is tried again by the next one.)
     this._broken = false;
+    // An endpoint that was reached, took the login and then refused the
+    // session — the database to enter does not exist there, say — answered:
+    // that answer is the error, as the server gave it, and not "no
+    // reachable endpoint", which it was. The other seeds were still tried.
+    if (refused !== null) throw refused;
     throw new SkaidbError(
       `no reachable endpoint in ${order.map((s) => `${s.host}:${s.port}`).join(', ')}: ${last && last.message}`);
   }

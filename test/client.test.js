@@ -1151,6 +1151,50 @@ test('a database entered with a USE statement is re-entered on a re-dialled conn
   });
 });
 
+test('a session database the server refuses on a new connection is the server\'s error, not "no reachable endpoint"', async () => {
+  const session = sessionServer();
+  // The endpoint was reached, and it answered: the error is its answer, a
+  // statement error like any other, and no fault of the member's.
+  const refused = (name) => (e) => e instanceof SkaidbError && e.message === `database "${name}" does not exist`
+    && !I.memberFault(e);
+  await withServer({ handle: session.handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    await c.query('USE gone');
+    session.refuse.add('gone');
+    srv.closeAll();
+    await until(() => !c.isUsable());
+    for (const run of [() => c.query('SELECT count(*) FROM notes'), () => c.query('INSERT INTO notes (id) VALUES ($1)', [1]),
+      () => c.batch('INSERT INTO notes (id) VALUES ($1)', [[1]]), () => collect(c.stream('SELECT count(*) FROM notes'))]) {
+      await assert.rejects(run(), refused('gone'));
+    }
+    assert.deepEqual(session.where(), []);
+    await c.end();
+    // connect() itself, with a database option the server does not have.
+    const d = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret', database: 'gone' });
+    await assert.rejects(d.connect(), refused('gone'));
+    await until(() => srv.sockets.size === 0);                  // and its socket is not left open
+    // With several seeds: one that could not be reached does not hide the
+    // answer of the one that was.
+    const dead = net.createServer();
+    await new Promise((r) => dead.listen(0, '127.0.0.1', r));
+    const deadPort = dead.address().port;
+    await new Promise((r) => dead.close(r));
+    for (let i = 0; i < 6; i++) {                               // the seeds are shuffled: both orders
+      const e = new Client({ seeds: [`127.0.0.1:${deadPort}`, `127.0.0.1:${srv.port}`], password: 'secret', database: 'gone' });
+      await assert.rejects(e.connect(), refused('gone'));
+    }
+    // No endpoint reached at all is still what it was.
+    const f = new Client({ host: '127.0.0.1', port: deadPort, password: 'secret', database: 'gone' });
+    await assert.rejects(f.connect(),
+      (x) => x instanceof SkaidbError && /^no reachable endpoint in 127\.0\.0\.1:\d+: connect failed/.test(x.message));
+    // A pool's checkout reports it the same way.
+    const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret', database: 'gone' });
+    await assert.rejects(pool.acquire(), refused('gone'));
+    await pool.end();
+  });
+});
+
 test('Pool: a borrower\'s USE survives a re-dial of its connection and is not the next borrower\'s database', async () => {
   const session = sessionServer();
   await withServer({ handle: session.handle }, async (srv) => {
