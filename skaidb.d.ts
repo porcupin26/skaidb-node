@@ -235,7 +235,9 @@ export class Client {
 
   /**
    * Dial the seeds in shuffled order until one connects and authenticates,
-   * then send Hello and `USE <database>` if one was given.
+   * then send Hello and `USE <database>` if one was given. Until it has
+   * resolved, every statement rejects with `not connected: await connect()
+   * first`.
    */
   connect(): Promise<void>;
 

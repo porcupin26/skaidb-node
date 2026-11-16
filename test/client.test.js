@@ -721,6 +721,78 @@ test('a connection the server dropped is re-dialled on the next statement; prepa
   });
 });
 
+// Every way a statement leaves a client, each as a call returning a promise.
+// `ran` collects a mark each time a transaction body is entered.
+const entryPoints = (c, ran) => ({
+  'query(text)': () => c.query('SELECT 1'),
+  'query(text, values)': () => c.query('SELECT $1', [1]),
+  'query(config)': () => c.query({ text: 'SELECT $1', values: [1] }),
+  'batch': () => c.batch('INSERT INTO t (id) VALUES ($1)', [[1], [2]]),
+  'batch without rows': () => c.batch('INSERT INTO t (id) VALUES ($1)', []),
+  'stream': () => collect(c.stream('SELECT 1')),
+  'stream with values': () => collect(c.stream('SELECT $1', [1])),
+  'transaction': () => c.transaction(async (tx) => { ran.push('body'); await tx.query('SELECT 1'); }),
+  'subscribe': () => collect(c.subscribe('events')),
+});
+
+// Each entry point of `c` rejects with a SkaidbError whose message is `message`.
+async function rejectsEverywhere(c, message, what) {
+  const ran = [];
+  for (const [name, call] of Object.entries(entryPoints(c, ran))) {
+    await assert.rejects(call(), (e) => e instanceof SkaidbError && e.message === message, `${what}: ${name}`);
+  }
+  assert.deepEqual(ran, [], `${what}: the transaction body never runs`);
+}
+
+test('a client that is not connected rejects every statement with a SkaidbError saying so', async () => {
+  const NOT_CONNECTED = 'not connected: await connect() first';
+  const handle = (req) => (req.op === 1 ? F.rows(['v'], [[1]]) : req.op === 5 ? F.ddl() : undefined);
+  await withServer({ handle }, async (srv) => {
+    // Constructed, never connected: nothing is dialled and nothing is sent.
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await rejectsEverywhere(c, NOT_CONNECTED, 'never connected');
+    assert.equal(srv.connections, 0);
+    assert.equal(c.isUsable(), false);
+    // While connect() is still running.
+    const connecting = c.connect();
+    await rejectsEverywhere(c, NOT_CONNECTED, 'connect() in flight');
+    await connecting;
+    // Once connected the same client works: the refusals left nothing behind.
+    assert.deepEqual((await c.query('SELECT 1')).rows, [{ v: 1 }]);
+    assert.equal(await c.transaction(async (tx) => (await tx.query('SELECT 1')).rows[0].v), 1);
+    assert.deepEqual(await collect(c.stream('SELECT 1')), []);
+    assert.equal(srv.connections, 1);
+    await c.end();
+
+    // connect() failed: refused credentials, and nothing listening at all.
+    const denied = new Client({ host: '127.0.0.1', port: srv.port, password: 'nope' });
+    await assert.rejects(denied.connect(), /authentication denied/);
+    await rejectsEverywhere(denied, NOT_CONNECTED, 'connect() denied');
+    const dead = net.createServer();
+    await new Promise((r) => dead.listen(0, '127.0.0.1', r));
+    const deadPort = dead.address().port;
+    await new Promise((r) => dead.close(r));
+    const unreachable = new Client({ host: '127.0.0.1', port: deadPort, password: 'secret', connectTimeout: 500 });
+    await assert.rejects(unreachable.connect(), /no reachable endpoint/);
+    await rejectsEverywhere(unreachable, NOT_CONNECTED, 'connect() refused');
+    await unreachable.end();
+  });
+  // A handshake that has not finished: the socket is there, the connection
+  // is not. A statement must not be written into the middle of the handshake.
+  const frames = [];
+  const silent = net.createServer((sock) => { sock.on('data', (d) => frames.push(d)); sock.on('error', () => {}); });
+  await new Promise((r) => silent.listen(0, '127.0.0.1', r));
+  const stalled = new Client({ host: '127.0.0.1', port: silent.address().port, password: 'secret' });
+  const never = stalled.connect();                    // AuthStart goes out; no challenge ever comes
+  never.catch(() => {});
+  await until(() => frames.length === 1);
+  await rejectsEverywhere(stalled, NOT_CONNECTED, 'handshake in flight');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(frames.length, 1);                     // still only the AuthStart
+  stalled._sock.destroy();
+  await new Promise((r) => silent.close(r));
+});
+
 test('Pool reuses idle connections, bounds the idle set, and discards broken ones', async () => {
   await withServer({ handle: (req) => (req.op === 1 ? F.rows(['v'], [[1]]) : F.ddl()) }, async (srv) => {
     const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret', maxsize: 1 });

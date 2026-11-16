@@ -643,7 +643,15 @@ class Client {
    */
   async _ensureLive() {
     if (this._closed) throw new SkaidbError('connection is closed');
-    if (!this._broken || this._reconnecting) return;
+    if (this._reconnecting) return;
+    if (!this._broken) {
+      // No connection, and none was lost: connect() was never called, has
+      // not finished (the socket may exist, mid-handshake), or failed.
+      // Nothing is dialled outside connect(), so say so instead of writing
+      // to a socket that is not there or not ready.
+      if (this._connected === null) throw new SkaidbError('not connected: await connect() first');
+      return;
+    }
     // A transaction lives on the connection its BEGIN went out on and died
     // with it. Re-dialling here would send the rest of it — and its COMMIT —
     // to a connection with no transaction open, where each statement
