@@ -243,6 +243,43 @@ test('a statement the prepared cache has no room for is closed after it ran, so 
   });
 });
 
+test('a prepare refused because the statement table is full is that error, not a fallback to literals', async () => {
+  const FULL = 'too many prepared statements (max 256); close some first';
+  let refusal = FULL;
+  const texts = [];
+  const handle = (req) => {
+    if (req.op === 2) return F.error(refusal);
+    if (req.op === 1) { texts.push(req.sql); return F.ddl(); }
+    return undefined;
+  };
+  await withServer({ handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const when = new Date(5);
+    // As text the Date would have gone out as the number 5 and the Buffer as
+    // the string '7a': a statement that can be prepared is never sent that way.
+    const err = await c.query('INSERT INTO t (id, at, raw) VALUES ($1, $2, $3)', [1, when, Buffer.from('z')]).catch((e) => e);
+    assert.ok(err instanceof SkaidbError);
+    assert.equal(err.message, FULL);
+    assert.equal(I.memberFault(err), false);           // the server answered: a statement error
+    await assert.rejects(c.batch('INSERT INTO t (id, at) VALUES ($1, $2)', [[1, when]]),
+      (e) => e instanceof SkaidbError && e.message === FULL);
+    assert.deepEqual(texts, []);
+    assert.equal(c.isUsable(), true);
+    // Every refusal that is about the statement still falls back: a kind the
+    // server does not prepare, a statement whose grammar takes no `?` (the
+    // parse error of the `?` form), a server without the opcode.
+    for (refusal of ['statement kind cannot be prepared', 'expected a quoted string, found Question',
+      'protocol error: unknown opcode']) {
+      texts.length = 0;
+      assert.equal((await c.query('CREATE USER u PASSWORD $1', ["p'w"])).command, 'DDL', refusal);
+      assert.deepEqual(texts, ["CREATE USER u PASSWORD 'p''w'"], refusal);
+    }
+    assert.equal(srv.connections, 1);
+    await c.end();
+  });
+});
+
 test('ResultSets from a CALL that EMITs land under resultSets with the last set as rows', async () => {
   const script = {
     'CALL report()': F.resultSets([[['a'], [[1], [2]]], [['b', 'c'], [['x', 'y']]]]),

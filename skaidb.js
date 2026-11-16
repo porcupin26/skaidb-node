@@ -23,6 +23,10 @@ const CONSISTENCY = { ONE: 0, QUORUM: 1, ALL: 2 };
 // prepared, run and closed.
 const PREPARED_CACHE_MAX = 240;
 
+// How the server refuses a prepare when the connection's statement table is
+// full: "too many prepared statements (max 256); close some first".
+const STATEMENT_TABLE_FULL = 'too many prepared statements';
+
 // How much of an abandoned stream is worth reading out before dropping the
 // connection instead. The server sends ~256 KB row chunks, so this is a few
 // dozen of them: past that, transferring the remainder of a large scan costs
@@ -1114,7 +1118,8 @@ class Client {
    * Prepare `sql` on the SERVER, returning {id, nparams, cached}. Cached per
    * connection — a prepared id only means anything on the connection that
    * created it. Returns null when the server declines the statement kind
-   * (DDL, session statements), so the caller falls back to text binding.
+   * (DDL, session statements), so the caller falls back to text binding;
+   * throws the server's error when it has no slot left for the statement.
    *
    * `cached` is false once the cache is full: the caller then closes the id
    * when the statement has run (_closePrepared), since nothing will use it
@@ -1135,7 +1140,19 @@ class Client {
       if (v.cached) this._prepared.set(sql, v);
       return v;
     }
-    if (tag === 3) { r.text(); return null; }   // unpreparable: fall back
+    if (tag === 3) {
+      // An Error about the statement means "send it as text": a kind the
+      // server does not prepare, a statement whose grammar takes no `?`
+      // (the `?` form then fails to parse; a statement that is simply
+      // malformed fails the same way as text, with the server's parse
+      // error), a server without the opcode. A full statement table is
+      // about the connection instead, and the statement can be prepared:
+      // as text it would run with a Date as a number and a Buffer as a hex
+      // string, so that refusal is the error.
+      const msg = r.text();
+      if (msg.startsWith(STATEMENT_TABLE_FULL)) throw statementError(msg);
+      return null;
+    }
     throw new SkaidbError(`unexpected prepare response tag ${tag}`);
   }
 

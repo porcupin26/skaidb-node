@@ -100,7 +100,11 @@ Placeholders are `$1, $2, …`. Rules:
   values as **correctly quoted SQL literals**: strings with `'` doubled,
   numbers as is, booleans `TRUE`/`FALSE`, `null`/`undefined` → `NULL`, `Date`
   → epoch milliseconds, `Buffer` → hex string. Arrays and objects cannot be
-  bound this way (`cannot bind value of type object`).
+  bound this way (`cannot bind value of type object`). Only a refusal that
+  is about the statement falls back: if the server has no statement slot
+  left on the connection (`too many prepared statements …`), the call
+  rejects with that error rather than run a preparable statement with
+  literals.
 
 ### `client.batch(sql, rows, opts?): Promise<number>`
 
