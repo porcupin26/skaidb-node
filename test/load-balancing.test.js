@@ -12,10 +12,11 @@ const { FakeServer, F } = require('./fake-server');
  * `delay` ms), `SHOW ENDPOINTS` answers `listing()`, `SHOW DATABASES` (the
  * pool's probe) answers no rows, anything else is a one-row mutation.
  * `srv.refuse` closes each new connection before the handshake; `oldServer`
- * (or no `listing`) answers SHOW ENDPOINTS with a parse error.
+ * (or no `listing`) answers SHOW ENDPOINTS with a parse error; `mute` never
+ * answers it at all.
  */
 async function member(name, opts = {}) {
-  const m = { name, delay: 0, oldServer: false, listing: null, statements: [] };
+  const m = { name, delay: 0, oldServer: false, mute: false, listing: null, statements: [] };
   m.srv = await new FakeServer({
     password: opts.password,
     host: opts.host,
@@ -23,6 +24,7 @@ async function member(name, opts = {}) {
       if (req.op !== 1) return undefined;                          // Hello -> Ddl
       m.statements.push(req.sql);
       if (req.sql === 'SHOW ENDPOINTS') {
+        if (m.mute) return [];
         if (m.oldServer || m.listing === null) {
           return F.error('parse error: expected TABLES, found ENDPOINTS');
         }
@@ -441,6 +443,34 @@ test('pool: a standalone server turns discovery off and keeps the seeds', () => 
   const asked = ms.reduce((n, m) => n + m.statements.filter((s) => s === 'SHOW ENDPOINTS').length, 0);
   assert.equal(asked, 1);
   assert.deepEqual(p.members().map((r) => [r.state, r.canonical]), [['ready', null], ['ready', null]]);
+}));
+
+test('pool: a member that never answers SHOW ENDPOINTS fails the checkout after three dials instead of dialling for good', () => withMembers('ab', async ([a, b], pool) => {
+  a.mute = true;
+  // The only member: each new connection is given up on when discovery gets
+  // no answer, and the fourth is not dialled.
+  const p = pool([a], { discover: true, connectTimeout: 80 });
+  const t0 = Date.now();
+  const lost = await Promise.race([p.acquire().catch((e) => e), sleep(3000)]);
+  assert.ok(lost instanceof SkaidbError, `acquire() settled: ${lost}`);
+  assert.equal(lost.message, 'every new connection broke during member discovery');
+  assert.ok(Date.now() - t0 < 1500, 'three answer timeouts, not more');
+  // The pool's own refresh goes the same way, once, and waits for its next
+  // turn: three dials each, and nothing dials on and on.
+  await until(() => p._nextRefresh > 0 && !p._refreshing, 2000, 'the background refresh gives up too');
+  assert.equal(a.srv.connections, 6);
+  await sleep(400);
+  assert.equal(a.srv.connections, 6);
+  await until(() => a.srv.sockets.size === 0, 2000, 'every one of them was closed');
+  // It answers again: the next checkout works, and discovery with it.
+  a.mute = false;
+  a.listing = () => [];
+  assert.equal(await who(p), 'a');
+
+  // With another member to go to, the checkout goes there.
+  a.mute = true;
+  const q = pool([a, b], { discover: true, connectTimeout: 80, loadBalancing: 'round_robin' });
+  assert.equal(await who(q), 'b');
 }));
 
 // ---- read-your-writes -------------------------------------------------------

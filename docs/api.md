@@ -351,7 +351,7 @@ An unknown `loadBalancing` or `idleOrder`, `maxsize < 1` or
 
 | Member | Meaning |
 |---|---|
-| `pool.acquire(options?): Promise<Client>` | An idle connection to the member the policy picks, validated with `isUsable()` (a dead one is discarded and the next tried), or one freshly dialed to it — a failed dial falls through to the other usable members, then to the unusable ones. `options.affinity` (any value; a user or session id) scopes `readYourWrites`; without it checkouts share one pool-wide key. Rejects with `pool is closed` after `end()`, with `no reachable endpoint in …` when no member can be dialed, and with the server's own error when a member was reached and refused the session (the pool's `database` does not exist). |
+| `pool.acquire(options?): Promise<Client>` | An idle connection to the member the policy picks, validated with `isUsable()` (a dead one is discarded and the next tried), or one freshly dialed to it — a failed dial falls through to the other usable members, then to the unusable ones. `options.affinity` (any value; a user or session id) scopes `readYourWrites`; without it checkouts share one pool-wide key. Rejects with `pool is closed` after `end()`, with `no reachable endpoint in …` when no member can be dialed, with the server's own error when a member was reached and refused the session (the pool's `database` does not exist), and with `every new connection broke during member discovery` when, with `discover`, three new connections in a row were lost to a member that takes the login and never answers `SHOW ENDPOINTS`. |
 | `pool.release(conn): Promise<void>` | Returns a connection; closes it instead when it is broken, its member is ejected, not `ready` or gone, the pool is closed, `maxsize` idle connections already exist, or a `transaction()` may still be open on it (one still running, or one whose `ROLLBACK` failed). A connection its borrower moved to another database with `USE` is first put back into the pool's `database` (and closed if that fails), so the next borrower starts there; a pool without a `database` option leaves the connection where its borrower left it. |
 | `pool.withConnection(fn)` · `pool.withConnection(options, fn)`: `Promise<T>` | `acquire(options)`, run `fn(conn)`, `release()` however `fn` ends. |
 | `pool.transaction(body, opts?): Promise<T>` | [`client.transaction(body, opts)`](#clienttransactionbody-opts-promiset) on one checked-out connection: checked out once, held for every statement and every run, released however it ends. `body` gets that connection. `opts = { attempts?, begin?, affinity? }`, `affinity` as in `acquire()`. Bad arguments reject before a connection is checked out. |
@@ -402,7 +402,10 @@ The rules are shared by every skaidb driver
   rather than counted twice. A member that turns `ready` again starts with a
   fresh latency average. A server that answers `SHOW ENDPOINTS` with an
   error (older than the statement) or with no rows (a standalone server)
-  turns discovery off and the seeds stay as they are.
+  turns discovery off and the seeds stay as they are. A member that does
+  not answer it within `connectTimeout` costs the checkout that connection
+  and counts as a transport failure of the member; after three such
+  connections in a row the checkout rejects instead of dialling on.
 - **Read-your-writes.** A statement counts as a write unless its first
   keyword (after whitespace, comments and opening parentheses) is `SELECT`,
   `SHOW`, `EXPLAIN`, `DESCRIBE`, `DESC`, `VALUES`, `WITH` or `USE`. After a

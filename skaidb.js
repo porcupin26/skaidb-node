@@ -1666,6 +1666,9 @@ const MAINTAIN_TICK_MS = 250;
 const REFRESH_NOT_READY_MS = 5000;
 // Affinity keys kept before expired ones are swept out.
 const AFFINITY_SWEEP_AT = 4096;
+// Dials a checkout makes when member discovery keeps breaking the new
+// connection (the member never answers it) before it gives up.
+const CHECKOUT_ATTEMPTS = 3;
 
 const POLICIES = ['random', 'round_robin', 'least_latency'];
 const LISTED_STATES = ['ready', 'resyncing', 'unreachable'];
@@ -1822,6 +1825,7 @@ class Pool extends EventEmitter {
    */
   async acquire(options = {}) {
     const affinity = options && options.affinity !== undefined ? options.affinity : null;
+    let broke = 0;            // new connections that did not outlive discovery
     for (;;) {
       if (this.closed) throw new SkaidbError('pool is closed');
       const target = this._pick(affinity);
@@ -1839,6 +1843,14 @@ class Pool extends EventEmitter {
       // locally, so validate before handing it out; discard and try again.
       if (!conn.isUsable()) {
         await conn.end().catch(() => {});
+        // A new one that discovery broke — a member that takes the login
+        // and then never answers SHOW ENDPOINTS — is replaced only so many
+        // times: each failure counts against the member, so with another
+        // member to go to the next dial goes there, and without one this
+        // would dial for good.
+        if (idle === null && ++broke >= CHECKOUT_ATTEMPTS) {
+          throw new SkaidbError('every new connection broke during member discovery');
+        }
         continue;
       }
       const m = this._members.get(conn._poolEp);
