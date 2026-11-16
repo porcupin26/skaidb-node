@@ -675,6 +675,70 @@ test('batch sends one OP_EXECUTE_BATCH with typed rows and returns the total', a
   });
 });
 
+test('connectTimeout bounds the handshake too: a peer that accepts the connection and never answers is given up on', async () => {
+  // Accepts the connection, reads what it is sent and never answers.
+  const accepted = [];
+  const mute = (sock) => { accepted.push(sock); sock.on('error', () => {}); sock.resume(); };
+  const silent = net.createServer(mute);
+  await new Promise((r) => silent.listen(0, '127.0.0.1', r));
+  const silentPort = silent.address().port;
+  const timedOut = /^no reachable endpoint in 127\.0\.0\.1:\d+: connect timeout$/;
+  try {
+    const c = new Client({ host: '127.0.0.1', port: silentPort, password: 'secret', connectTimeout: 150 });
+    const t0 = Date.now();
+    await assert.rejects(settles(c.connect()), (e) => e instanceof SkaidbError && timedOut.test(e.message));
+    assert.ok(Date.now() - t0 >= 140, 'not before the timeout');
+    // The socket is closed, not left to the peer, and the client is as it
+    // is after any failed connect.
+    await until(() => accepted.length === 1 && accepted[0].destroyed);
+    assert.equal(c.isUsable(), false);
+    await assert.rejects(c.query('SELECT 1'), /not connected: await connect\(\) first/);
+
+    // The timer ends with the attempt: a connect that failed at once (here
+    // refused) does not keep the process alive for the rest of the timeout.
+    const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+    const before = timers();
+    const dead = net.createServer();
+    await new Promise((r) => dead.listen(0, '127.0.0.1', r));
+    const deadPort = dead.address().port;
+    await new Promise((r) => dead.close(r));
+    const refused = new Client({ host: '127.0.0.1', port: deadPort, password: 'secret', connectTimeout: 60000 });
+    await assert.rejects(refused.connect(), /connect failed/);
+    assert.equal(timers(), before);
+
+    await withServer({ handle: (req) => (req.op === 1 ? F.rows(['v'], [[1]]) : undefined) }, async (srv) => {
+      // The walk goes on to the next seed, and the socket it gave up on —
+      // whose close arrives later — is not taken for the new connection's.
+      for (let i = 0; i < 6; i++) {
+        const d = new Client({ seeds: [`127.0.0.1:${silentPort}`, `127.0.0.1:${srv.port}`], password: 'secret', connectTimeout: 150 });
+        await settles(d.connect());
+        assert.equal(d.port, srv.port);
+        await new Promise((r) => setTimeout(r, 20));
+        assert.equal(d.isUsable(), true);
+        assert.deepEqual((await d.query('SELECT 1')).rows, [{ v: 1 }]);
+        await d.end();
+      }
+      // A re-dial is a connect like any other: a statement on a client whose
+      // server stopped answering handshakes fails after the timeout, each time.
+      const e = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret', connectTimeout: 150 });
+      await e.connect();
+      const answer = srv._onConnection;
+      srv._onConnection = mute;
+      srv.closeAll();
+      await until(() => !e.isUsable());
+      for (let i = 0; i < 2; i++) {
+        await assert.rejects(settles(e.query('SELECT 1')), (x) => x instanceof SkaidbError && timedOut.test(x.message));
+      }
+      srv._onConnection = answer;
+      assert.deepEqual((await settles(e.query('SELECT 1'))).rows, [{ v: 1 }]);
+      await e.end();
+    });
+  } finally {
+    for (const sock of accepted) sock.destroy();
+    await new Promise((r) => silent.close(r));
+  }
+});
+
 test('seeds: a dead endpoint is skipped, a live one wins', async () => {
   const dead = net.createServer();
   await new Promise((r) => dead.listen(0, '127.0.0.1', r));

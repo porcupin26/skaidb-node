@@ -18,7 +18,7 @@ Everything is exported from the package root. Types for TypeScript are in
 | `password` | `string` | `''` | Password. Empty means anonymous; mutual authentication is skipped. |
 | `database` | `string` | — | The session database: entered with `USE` after every (re)connect. A `USE` statement sent later replaces it for this client ([reconnect](#reconnect)). |
 | `consistency` | `'ONE' \| 'QUORUM' \| 'ALL' \| 0 \| 1 \| 2` | `'QUORUM'` | Default for every statement on this client. Names are case-insensitive. |
-| `connectTimeout` | `number` (ms) | `10000` | Per seed, covering TCP connect and the TLS handshake. |
+| `connectTimeout` | `number` (ms) | `10000` | Per seed, covering the whole dial: TCP connect, TLS, the login handshake, Hello and `USE`. A seed that takes longer — one that accepts the connection and then says nothing included — fails with `connect timeout` and the next is tried. |
 | `tls` | `boolean` | `false` | TLS with the system trust store. |
 | `tlsCa` | `string` (path) | — | PEM CA bundle to verify the server against. Implies `tls`. |
 | `tlsInsecure` | `boolean` | `false` | TLS without certificate verification. Implies `tls`. Development only. |

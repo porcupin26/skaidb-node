@@ -605,12 +605,31 @@ class Client {
         ready = 'connect';
       }
       sock.setNoDelay(true);
-      const onErr = (e) => reject(new SkaidbError(`connect failed: ${e.message}`));
+      // One timer for the whole dial: the TCP connect, TLS, the login
+      // handshake, Hello and USE. A peer that accepts the connection and
+      // then says nothing would otherwise hold connect() — and a statement
+      // that re-dials — for good. It ends with the attempt, however that
+      // ends, so a failed connect leaves no timer behind.
+      const to = setTimeout(() => {
+        const e = new SkaidbError('connect timeout');
+        // Mid-handshake the socket is the client's already: let go of it
+        // before destroying it — its 'close' comes on a later tick, when
+        // the next seed may be dialling — and fail the read the handshake
+        // is waiting in.
+        if (this._sock === sock) {
+          const waiting = this._waiters;
+          this._sock = null;
+          this._buf = Buffer.alloc(0);
+          this._frames = [];
+          this._waiters = [];
+          for (const w of waiting) w.reject(e);
+        }
+        sock.destroy();
+        reject(e);
+      }, this.connectTimeout);
+      const onErr = (e) => { clearTimeout(to); reject(new SkaidbError(`connect failed: ${e.message}`)); };
       sock.once('error', onErr);
-      const to = setTimeout(() => { sock.destroy(); reject(new SkaidbError('connect timeout')); },
-        this.connectTimeout);
       sock.once(ready, () => {
-        clearTimeout(to);
         sock.removeListener('error', onErr);
         this._sock = sock;
         // Events from a socket that is no longer the client's are ignored.
@@ -633,7 +652,8 @@ class Client {
             ? this._doQuery(useStatement(this.database), this.consistency, 'object')
                 .then(() => undefined)
             : undefined)
-          .then(resolve, (e) => {
+          .then((v) => { clearTimeout(to); resolve(v); }, (e) => {
+            clearTimeout(to);
             // A seed that fails the handshake (denied, a bad signature, a
             // protocol error) must not keep its socket: close it and drop
             // anything it left unread, so the next seed starts clean.

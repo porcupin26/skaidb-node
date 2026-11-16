@@ -54,7 +54,10 @@ export interface ClientOptions {
   password?: string;
   /** Default consistency for every statement on this client. Default `QUORUM`. */
   consistency?: Consistency;
-  /** Milliseconds allowed for TCP connect (+ TLS handshake) per seed. Default `10000`. */
+  /**
+   * Milliseconds allowed per seed for the whole dial: TCP connect, TLS, the
+   * login handshake, Hello and `USE`. Default `10000`.
+   */
   connectTimeout?: number;
   /** Use TLS with the system trust store. Implied by `tlsCa` or `tlsInsecure`. */
   tls?: boolean;

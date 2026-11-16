@@ -80,7 +80,7 @@ new Client({
 
   // How.
   consistency: 'QUORUM',        // 'ONE' | 'QUORUM' | 'ALL' (or 0 | 1 | 2); default QUORUM
-  connectTimeout: 10000,        // ms per seed, TCP + TLS handshake
+  connectTimeout: 10000,        // ms per seed: TCP, TLS and the login handshake
 
   // TLS (see below).
   tls: false, tlsCa: undefined, tlsInsecure: false, tlsServerName: 'skaidb',
