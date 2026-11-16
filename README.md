@@ -449,6 +449,12 @@ open on. Every `Client` option passes through; `seeds` (or `host`/`port`)
 name the starting members. `pool.transaction()` runs a
 [transaction](#transactions) on one checked-out connection.
 
+With a `database` option every borrower starts in that database: a
+connection whose borrower moved it elsewhere with `USE` is put back before
+it is pooled. Without the option a pooled connection stays where its last
+borrower left it, so name the database in the pool's options, or in each
+statement, when it matters.
+
 ### Balancing across members
 
 By default (`loadBalancing: 'random'`) each new connection dials the members

@@ -48,6 +48,14 @@ const until = async (pred, ms = 2000) => {
   }
 };
 
+// `promise`, or a rejection when it has not settled within `ms`: a call that
+// hangs must fail its test, not stall the suite.
+const settles = (promise, ms = 2000) => {
+  let timer;
+  const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`still pending after ${ms} ms`)), ms); });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+};
+
 test('connect runs SCRAM, verifies the server signature and sends Hello with the package version', async () => {
   await withServer({}, async (srv) => {
     const c = new Client({ host: '127.0.0.1', port: srv.port, user: 'ada', password: 'secret' });
@@ -744,8 +752,9 @@ function sessionServer() {
           return F.ddl();
         }
         record(req.sql);
-        if (req.op === 5) return F.ddl();
-        return /^select/i.test(req.sql) ? F.rows(['db'], [[conn.db]]) : F.mutation(1);
+        const select = /^select/i.test(req.sql);
+        if (req.op === 5) return select ? [F.header(['db']), F.chunk([[conn.db]]), F.chunk([[conn.db]]), F.end()] : F.ddl();
+        return select ? F.rows(['db'], [[conn.db]]) : F.mutation(1);
       }
       case 2:
         conn.statements.push(req.sql);
@@ -845,6 +854,49 @@ test('a database entered with a USE statement is re-entered on a re-dialled conn
       (e) => e instanceof SkaidbError && /database "app" does not exist/.test(e.message));
     assert.deepEqual(session.where(), []);
     await c.end();
+  });
+});
+
+test('Pool: a borrower\'s USE survives a re-dial of its connection and is not the next borrower\'s database', async () => {
+  const session = sessionServer();
+  await withServer({ handle: session.handle }, async (srv) => {
+    const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret', database: 'app', maxsize: 1 });
+    try {
+      // A checked-out connection that is re-dialled re-enters the pool's database …
+      const conn = await pool.acquire();
+      assert.deepEqual(await countThenInsertAfterALoss(conn, srv), ['app', 1]);
+      // … or the one its borrower entered since.
+      await conn.query('USE other');
+      assert.deepEqual(await countThenInsertAfterALoss(conn, srv), ['other', 1]);
+      await pool.release(conn);
+      // Back in the pool it is in the pool's database again: the next borrower gets that.
+      const next = await pool.acquire();
+      assert.equal(next, conn);
+      assert.equal(next.database, 'app');
+      assert.equal((await next.query('SELECT count(*) FROM notes')).rows[0].db, 'app');
+      await pool.release(next);
+      assert.equal(srv.connections, 3);
+      // The pool's database cannot be entered again: the connection is closed, not pooled.
+      await pool.withConnection((c) => c.query('USE other'));
+      assert.equal(pool.members()[0].idle, 1);
+      session.refuse.add('app');
+      const stuck = await pool.acquire();
+      await stuck.query('USE other');
+      await pool.release(stuck);
+      assert.equal(pool.members()[0].idle, 0);
+      assert.equal(stuck.isUsable(), false);
+      // Nor can it be while a stream the borrower left open holds the
+      // connection: closed as well, without waiting behind the stream.
+      session.refuse.clear();
+      const busy = await pool.acquire();
+      await busy.query('USE other');
+      assert.deepEqual((await busy.stream('SELECT 1').next()).value, { db: 'other' });   // one row read, never closed
+      await settles(pool.release(busy));
+      assert.equal(pool.members()[0].idle, 0);
+      assert.equal(busy.isUsable(), false);
+    } finally {
+      await pool.end();
+    }
   });
 });
 

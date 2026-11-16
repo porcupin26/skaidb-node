@@ -1701,6 +1701,9 @@ class Pool extends EventEmitter {
     // long: the driver has no read timeout, and a member that never answers
     // must not wedge a probe or a refresh for good.
     this._answerTimeout = clientOpts.connectTimeout || 10000;
+    // The database every pooled connection is in: one that a borrower left
+    // in another is put back before the next borrower gets it.
+    this._database = clientOpts.database || null;
     this._port = clientOpts.port || 7000;
     this._members = new Map();         // 'host:port' -> Member
     const seeds = clientOpts.seeds && clientOpts.seeds.length
@@ -1771,7 +1774,17 @@ class Pool extends EventEmitter {
     // clean-up ROLLBACK did not go through: the transaction may still be
     // open on the connection, and the next caller must not inherit it.
     const settled = conn._txn === null && !conn._txnRollbackFailed;
-    if (!this.closed && settled && conn.isUsable() && m && this._usable(m) && this._idle.length < this.maxsize) {
+    const keep = () => !this.closed && settled && conn.isUsable() && m && this._usable(m)
+      && this._idle.length < this.maxsize;
+    // The borrower entered another database with USE: the next borrower
+    // gets the pool's own. If that cannot be entered again the connection
+    // is not pooled.
+    // Not behind a stream the borrower left open, though: that USE would
+    // wait for a stream nobody is going to close.
+    if (keep() && this._database !== null && conn.database !== this._database && conn._streams.size === 0) {
+      await this._bounded(conn, conn.query(useStatement(this._database))).catch(() => {});
+    }
+    if (keep() && (this._database === null || conn.database === this._database)) {
       this._idle.push(conn);
       return;
     }

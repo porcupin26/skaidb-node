@@ -413,6 +413,8 @@ export class Pool extends EventEmitter {
   /**
    * Return a connection; it is closed instead if broken, its member is not
    * usable, the pool is full, or a `transaction()` may still be open on it.
+   * One its borrower moved to another database with `USE` is put back into
+   * the pool's `database` first.
    */
   release(conn: Client): Promise<void>;
   /** Run `fn` with a checked-out connection and return it however `fn` ends. */
