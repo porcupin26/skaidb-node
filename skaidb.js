@@ -632,6 +632,11 @@ class Client {
       sock.once(ready, () => {
         sock.removeListener('error', onErr);
         this._sock = sock;
+        // A prepared id is an index on the connection that issued it: on
+        // this one the same number is unknown, or names another statement.
+        // So every dial starts with an empty cache — the re-dial of a lost
+        // connection, and connect() called again by the application.
+        this._prepared.clear();
         // Events from a socket that is no longer the client's are ignored.
         // _fail() destroys a socket and nulls the slot, but its 'close'
         // fires on a LATER tick — after a caller may already have re-dialled
@@ -919,9 +924,9 @@ class Client {
               throw new SkaidbError(
                 `statement expects ${p.nparams} parameters, got ${q.params.length}`);
             }
-            return await this._doPrepared(p.id, q.params, consistency, rowMode);
+            return await this._doPrepared(this._idOf(p), q.params, consistency, rowMode);
           } finally {
-            if (!p.cached) await this._closePrepared(p.id);
+            if (!p.cached) await this._closePrepared(p);
           }
         }
       }
@@ -1166,7 +1171,7 @@ class Client {
         }
         const head = Buffer.allocUnsafe(10);
         head[0] = 7; head[1] = consistency;
-        head.writeUInt32LE(p.id, 2); head.writeUInt32LE(ordered.length, 6);
+        head.writeUInt32LE(this._idOf(p), 2); head.writeUInt32LE(ordered.length, 6);
         const parts = [head];
         for (const r of ordered) {
           const cnt = Buffer.alloc(2); cnt.writeUInt16LE(r.length, 0);
@@ -1177,7 +1182,7 @@ class Client {
         this._noteStatement(sql);
         return res.rowCount || 0;
       } finally {
-        if (!p.cached) await this._closePrepared(p.id);
+        if (!p.cached) await this._closePrepared(p);
       }
     });
     this._queryChain = run.catch(() => {});
@@ -1296,7 +1301,7 @@ class Client {
    */
   async _prepare(sql) {
     const hit = this._prepared.get(sql);
-    if (hit) return hit;
+    if (hit && hit.sock === this._sock) return hit;
     const body = Buffer.from(sql, 'utf8');
     const head = Buffer.allocUnsafe(5);
     head[0] = 2; head.writeUInt32LE(body.length, 1);
@@ -1305,7 +1310,8 @@ class Client {
     if (tag === 4) {
       const id = r.u32();
       const nparams = r.u16();
-      const v = { id, nparams, cached: this._prepared.size < PREPARED_CACHE_MAX };
+      // `sock` ties the id to the connection that issued it (see _idOf).
+      const v = { id, nparams, cached: this._prepared.size < PREPARED_CACHE_MAX, sock: this._sock };
       if (v.cached) this._prepared.set(sql, v);
       return v;
     }
@@ -1329,13 +1335,24 @@ class Client {
    * Free a prepared statement's slot on the server (OP_CLOSE). Best effort:
    * the answer — Ddl, or an Error for an id the server does not have — is
    * read and dropped, and a connection that is gone took its statements
-   * with it.
+   * with it: a close is only ever sent on the connection that issued the
+   * id.
    */
-  async _closePrepared(id) {
-    if (this._closed || this._broken) return;
+  async _closePrepared(p) {
+    if (this._closed || this._broken || p.sock !== this._sock) return;
     const req = Buffer.allocUnsafe(5);
-    req[0] = 4; req.writeUInt32LE(id, 1);
+    req[0] = 4; req.writeUInt32LE(p.id, 1);
     try { await this._request(req); } catch (_) { /* the connection went, and the statement with it */ }
+  }
+
+  /**
+   * The id of prepared statement `p`, which means something only on the
+   * connection that issued it: sent on another it would run whatever
+   * statement has that number there.
+   */
+  _idOf(p) {
+    if (p.sock !== this._sock) throw new SkaidbError('connection lost');
+    return p.id;
   }
 
   /** Execute a prepared statement with TYPED parameters. */

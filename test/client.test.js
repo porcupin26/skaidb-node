@@ -907,6 +907,35 @@ test('a statement prepared before a lost connection runs as itself on the re-dia
   });
 });
 
+test('connect() called again empties the prepared cache: no statement runs under an id of the previous connection', async () => {
+  const server = idsPerConnection();
+  await withServer({ handle: server.handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    await c.query(G_UPDATE, ['a', 1]);                          // id 0
+    await c.query(G_DELETE, ['b', 2]);                          // id 1
+    srv.closeAll();
+    await until(() => !c.isUsable());
+    await c.connect();                                          // the application reconnects by hand
+    // A statement new to the client takes id 0 on the new connection. The
+    // UPDATE, id 0 on the old one, must not run as it; nor may the DELETE
+    // be sent under an id the new connection never issued.
+    await c.query('INSERT INTO t (v, id) VALUES ($1, $2)', ['c', 3]);
+    await c.query(G_UPDATE, ['d', 4]);
+    await c.query(G_DELETE, ['e', 5]);
+    assert.deepEqual(server.texts().slice(2), [
+      'INSERT INTO t (v, id) VALUES (?, ?) ["c",3]', `${G_UPDATE_SENT} ["d",4]`, `${G_DELETE_SENT} ["e",5]`,
+    ]);
+    // The same on a client that is still connected when connect() is called again.
+    await c.connect();
+    await c.query(G_DELETE, ['f', 6]);
+    await c.query(G_UPDATE, ['g', 7]);
+    assert.deepEqual(server.texts().slice(5), [`${G_DELETE_SENT} ["f",6]`, `${G_UPDATE_SENT} ["g",7]`]);
+    assert.equal(srv.connections, 3);
+    await c.end();
+  });
+});
+
 test('a statement the cache did not keep is closed on the connection that prepared it, or not at all', async () => {
   const server = idsPerConnection();
   await withServer({ handle: server.handle }, async (srv) => {

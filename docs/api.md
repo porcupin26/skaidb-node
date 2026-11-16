@@ -98,7 +98,9 @@ Placeholders are `$1, $2, …`. Rules:
   The server's parameter count must equal the number of placeholders used
   (`statement expects N parameters, got M`).
 - Prepared statements are cached per connection by SQL text (240 entries).
-  The cache is dropped on reconnect since ids are connection-scoped. A
+  An id means something only on the connection that issued it, so the cache
+  is emptied on every dial — the re-dial of a lost connection, and
+  `connect()` called again — and each statement is prepared afresh there. A
   statement the full cache has no room for is prepared, run and closed each
   time (one more round trip), so a connection never uses up the 256
   statements the server keeps for it.
