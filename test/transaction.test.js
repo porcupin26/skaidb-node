@@ -402,6 +402,9 @@ test('transaction: a connection that dies under a statement is the usual connect
 // A transport failure as the driver reports one: a SkaidbError the server
 // did not answer with (a statement error is never a member's fault).
 const isTransport = (e) => e instanceof SkaidbError && !(e instanceof TransactionConflictError) && I.memberFault(e);
+// … under a statement in flight: `connection closed`, or `connection lost`
+// with the socket's own error after it when the socket reported one.
+const diedInFlight = (e) => isTransport(e) && /^connection (closed$|lost(:|$))/.test(e.message);
 const lostInTransaction = (e) => isTransport(e) && e.message === 'connection lost during a transaction';
 
 test('transaction: after the connection is lost, a body that catches the error and goes on sends nothing more — not its next write, not the COMMIT', async () => {
@@ -459,10 +462,11 @@ test('transaction: after the connection is lost, a body that catches the error a
       if (dies === 'COMMIT') {
         // In flight when the connection went: the usual connection error, which
         // does not say whether the COMMIT was applied. Not sent again, no ROLLBACK.
-        assert.ok(isTransport(out) && /^connection (closed|lost)$/.test(out.message), String(out));
+        assert.ok(diedInFlight(out), String(out));
+        assert.doesNotMatch(out.message, /commit/i);
         assert.deepEqual(rec.sqls(), ['BEGIN', 'UPDATE a SET v = 1', 'COMMIT']);
       } else {
-        assert.ok(isTransport(caught[0]) && /^connection (closed|lost)$/.test(caught[0].message), String(caught[0]));
+        assert.ok(diedInFlight(caught[0]), String(caught[0]));
         assert.ok(lostInTransaction(caught[1]), String(caught[1]));
         assert.ok(lostInTransaction(out), String(out));
         assert.deepEqual(rec.sqls(), ['BEGIN', 'UPDATE a SET v = 1', 'UPDATE b SET v = 1']);
@@ -494,7 +498,7 @@ test('transaction: the opening statement re-dials a connection lost while the cl
     for (const run of [() => c.query('SELECT 2'), () => c.transaction(async () => 'ran again')]) {
       srv.closeAll();
       const first = await run().catch((e) => e);
-      assert.ok(isTransport(first) && /^connection (closed|lost)$/.test(first.message), String(first));
+      assert.ok(diedInFlight(first), String(first));
       assert.ok(await run());
     }
     assert.equal(srv.connections, 4);

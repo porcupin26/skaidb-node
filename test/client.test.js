@@ -721,6 +721,39 @@ test('a connection the server dropped is re-dialled on the next statement; prepa
   });
 });
 
+test('a connection reset under a statement rejects it with a SkaidbError, as any lost connection does', async () => {
+  // The socket reports a reset as an 'error' (ECONNRESET), not as a close.
+  const sent = [];
+  const handle = (req, conn) => {
+    if (req.op !== 1) return undefined;
+    sent.push(req.sql);
+    if (req.sql === 'UPDATE resets') { conn.sock.resetAndDestroy(); return []; }
+    return F.rows(['v'], [[1]]);
+  };
+  await withServer({ handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    const lost = (e) => e instanceof SkaidbError && /^connection lost: .*ECONNRESET/.test(e.message)
+      && e.cause instanceof Error && e.cause.code === 'ECONNRESET' && I.memberFault(e);
+    await assert.rejects(c.query('UPDATE resets'), lost);
+    assert.equal(c.isUsable(), false);
+    assert.deepEqual((await c.query('SELECT 1')).rows, [{ v: 1 }]);    // re-dialled, as after any loss
+    assert.equal(srv.connections, 2);
+    // Inside a transaction: the statement gets that error, the rest of the
+    // body the usual one, and nothing more is sent.
+    sent.length = 0;
+    const caught = [];
+    await assert.rejects(c.transaction(async (tx) => {
+      caught.push(await tx.query('UPDATE resets').catch((e) => e));
+      caught.push(await tx.query('UPDATE after').catch((e) => e));
+      throw caught[0];
+    }), (e) => e === caught[0] && lost(e));
+    assert.ok(caught[1] instanceof SkaidbError && caught[1].message === 'connection lost during a transaction');
+    assert.deepEqual(sent, ['BEGIN', 'UPDATE resets']);
+    await c.end();
+  });
+});
+
 // Every way a statement leaves a client, each as a call returning a promise.
 // `ran` collects a mark each time a transaction body is entered.
 const entryPoints = (c, ran) => ({

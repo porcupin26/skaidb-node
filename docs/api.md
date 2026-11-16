@@ -287,6 +287,10 @@ Closes the connection. Terminal: any later statement rejects with
 
 A transport failure (socket error or close) rejects the in-flight statement
 with `connection lost` or `connection closed` and marks the client broken.
+When the socket reported an error of its own (a reset, a broken pipe, a TLS
+alert) the message is `connection lost: <that error's message>` — for
+example `connection lost: read ECONNRESET` — and the socket's error is the
+`SkaidbError`'s `cause`.
 The next `query()`, `batch()` or `stream()` first re-dials — the full seed
 walk, handshake, Hello and `USE` — then runs (except while a
 [`transaction()`](#clienttransactionbody-opts-promiset) is open, which

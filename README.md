@@ -527,7 +527,9 @@ Every error the driver raises is a `SkaidbError` (an `Error` subclass).
   ([Transactions](#transactions)); like any statement error it neither
   drops the connection nor counts against a pool member's health.
 - **Transport errors** reject the in-flight statement with `connection lost`
-  / `connection closed` and mark the client *broken*, not closed. The next
+  / `connection closed` (`connection lost: read ECONNRESET` and the like
+  when the socket reported an error, which is then the `cause`) and mark
+  the client *broken*, not closed. The next
   statement **re-dials** (through the seed walk), re-authenticates, re-sends
   `USE <database>` and clears the prepared-statement cache — except inside
   `transaction()`, which never reconnects mid-transaction. Because the failed

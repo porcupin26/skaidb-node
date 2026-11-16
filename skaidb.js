@@ -634,7 +634,11 @@ class Client {
   _fail(err) {
     if (this._closed || this._broken) return;
     this._broken = true;
-    const e = err instanceof Error ? err : new SkaidbError(String(err));
+    // The socket's own error (ECONNRESET, EPIPE, ETIMEDOUT, a TLS alert) is
+    // a plain Error: the caller gets a SkaidbError like for every other
+    // lost connection, with that error as its `cause`.
+    const e = err instanceof SkaidbError ? err
+      : new SkaidbError(`connection lost: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
     // Stop the transfer, not just the reader. The socket is in flowing
     // mode, so leaving it attached means the rest of an abandoned result
     // keeps arriving and `_onData` keeps pushing frames onto `_frames`
