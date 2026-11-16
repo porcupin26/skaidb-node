@@ -331,7 +331,10 @@ the socket (until the next statement reconnects it).
 
 Closes the connection. Terminal: any later statement rejects with
 `connection is closed` — also one that was waiting behind a stream that is
-still open on the client, which no longer holds the others up.
+still open on the client, which no longer holds the others up. A statement
+that is in flight when `end()` is called still gets its answer if the
+server sends one; if the connection closes first, it rejects with
+`connection is closed`.
 
 ### Reconnect
 

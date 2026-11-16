@@ -892,7 +892,16 @@ class Client {
   // _ensureLive and transparently re-dials. end() is what makes a client
   // terminal.
   _fail(err) {
-    if (this._closed || this._broken) return;
+    if (this._broken) return;
+    if (this._closed) {
+      // end() was called, and now the connection is gone: a statement that
+      // was in flight then and has not been answered will not be. It is
+      // told so — nothing else would ever settle it.
+      const waiting = this._waiters;
+      this._waiters = [];
+      for (const w of waiting) w.reject(new SkaidbError('connection is closed'));
+      return;
+    }
     this._broken = true;
     if (this._handTxn === 'open') this._handTxn = 'lost';
     // The socket's own error (ECONNRESET, EPIPE, ETIMEDOUT, a TLS alert) is

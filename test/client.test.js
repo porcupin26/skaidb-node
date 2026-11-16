@@ -761,6 +761,38 @@ test('end() lets go of a connection a stream still holds: later statements rejec
   });
 });
 
+test('a statement in flight when end() is called is answered if the server answers it, and rejects if the connection closes first', async () => {
+  // 'SELECT slow' is answered 40 ms later, 'SELECT never' not at all.
+  const handle = (req, conn) => {
+    if (req.op !== 1) return undefined;
+    if (req.sql === 'SELECT slow') { setTimeout(() => conn.send(F.rows(['v'], [[1]])), 40); return []; }
+    return req.sql === 'SELECT never' ? [] : F.rows(['v'], [[1]]);
+  };
+  await withServer({ handle, allowHalfOpen: true }, async (srv) => {
+    const inFlight = async (sql) => {
+      const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+      await c.connect();
+      const answer = c.query(sql);
+      answer.catch(() => {});
+      await until(() => srv.requests.some((q) => q.sql === sql));
+      const ended = c.end();                                  // sends this side's FIN; the server may still answer
+      return { c, answer, ended };
+    };
+    // Answered after end(): the answer is still read.
+    const slow = await inFlight('SELECT slow');
+    assert.deepEqual((await settles(slow.answer)).rows, [{ v: 1 }]);
+    await settles(slow.ended);
+    // Never answered: when the server closes, the statement is told the
+    // connection is closed. It used to wait for good.
+    const never = await inFlight('SELECT never');
+    await settles(never.ended);
+    await new Promise((r) => setTimeout(r, 30));
+    for (const sock of srv.sockets) sock.end();               // the server closes without a word
+    await assert.rejects(settles(never.answer), (e) => e instanceof SkaidbError && e.message === 'connection is closed');
+    await until(() => srv.sockets.size === 0);
+  });
+});
+
 test('seeds: a dead endpoint is skipped, a live one wins', async () => {
   const dead = net.createServer();
   await new Promise((r) => dead.listen(0, '127.0.0.1', r));
