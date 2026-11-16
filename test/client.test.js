@@ -793,6 +793,40 @@ test('a client that is not connected rejects every statement with a SkaidbError 
   await new Promise((r) => silent.close(r));
 });
 
+test('a closed client rejects every statement with "connection is closed", a closed pool with "pool is closed"', async () => {
+  await withServer({ handle: (req) => (req.op === 1 ? F.rows(['v'], [[1]]) : undefined) }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    await c.end();
+    const sent = srv.requests.length;
+    await rejectsEverywhere(c, 'connection is closed', 'closed');
+    // Closed without ever having been connected: closed all the same.
+    const never = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await never.end();
+    await rejectsEverywhere(never, 'connection is closed', 'closed before connecting');
+    assert.equal(srv.requests.length, sent);                   // nothing reached the server
+    assert.equal(srv.connections, 1);
+
+    // A pool has no such state: it dials when a connection is asked for …
+    const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    assert.deepEqual((await pool.withConnection((p) => p.query('SELECT 1'))).rows, [{ v: 1 }]);
+    assert.equal(await pool.transaction(async (tx) => (await tx.query('SELECT 1')).rows[0].v), 1);
+    const held = await pool.acquire();
+    await pool.end();
+    // … and once closed refuses to hand one out, whichever way it is asked.
+    const closed = (e) => e instanceof SkaidbError && e.message === 'pool is closed';
+    const ran = [];
+    await assert.rejects(pool.acquire(), closed);
+    await assert.rejects(pool.withConnection(() => { ran.push('fn'); }), closed);
+    await assert.rejects(pool.transaction(async () => { ran.push('body'); }), closed);
+    assert.deepEqual(ran, []);
+    // A connection checked out before the pool closed works until it is released; then it is closed.
+    assert.deepEqual((await held.query('SELECT 1')).rows, [{ v: 1 }]);
+    await pool.release(held);
+    await rejectsEverywhere(held, 'connection is closed', 'released to a closed pool');
+  });
+});
+
 test('Pool reuses idle connections, bounds the idle set, and discards broken ones', async () => {
   await withServer({ handle: (req) => (req.op === 1 ? F.rows(['v'], [[1]]) : F.ddl()) }, async (srv) => {
     const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret', maxsize: 1 });
