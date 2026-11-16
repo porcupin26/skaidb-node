@@ -815,6 +815,124 @@ test('a connection the server dropped is re-dialled on the next statement; prepa
   });
 });
 
+// Prepared-statement ids as the real server issues them: an index on the
+// connection, from 0, the lowest free one first — so the same number names
+// another statement, or none, on the next connection. Every execute is
+// recorded in `ran` with the text it ran under; every close in `closes`.
+function idsPerConnection() {
+  const ran = [];
+  const closes = [];
+  const unknown = (id) => F.error(`unknown prepared statement id ${id}`);
+  const handle = (req, conn) => {
+    if (conn.statements === undefined) conn.statements = [];
+    const sql = req.id === undefined ? undefined : conn.statements[req.id];
+    switch (req.op) {
+      case 1: return F.ddl();
+      case 2: {
+        let id = conn.statements.indexOf(null);
+        if (id < 0) id = conn.statements.length;
+        conn.statements[id] = req.sql;
+        return F.prepared(id, (req.sql.match(/\?/g) || []).length);
+      }
+      case 3: case 7:
+        if (typeof sql !== 'string') return unknown(req.id);
+        ran.push({ sql, values: req.op === 3 ? req.params : req.rows, sock: conn.sock });
+        if (/dies/.test(sql)) { conn.sock.destroy(); return []; }
+        return F.mutation(1);
+      case 4:
+        closes.push({ id: req.id, sql, sock: conn.sock });
+        if (typeof sql !== 'string') return unknown(req.id);
+        conn.statements[req.id] = null;
+        return F.ddl();
+      default: return undefined;                       // Hello -> Ddl
+    }
+  };
+  return { handle, ran, closes, texts: () => ran.map((r) => `${r.sql} ${JSON.stringify(r.values)}`) };
+}
+
+// Check G's pair: the same parameter count, a different effect.
+const G_UPDATE = 'UPDATE t SET v = $1 WHERE id = $2';
+const G_DELETE = 'DELETE FROM t WHERE v = $1 AND id = $2';
+const G_UPDATE_SENT = 'UPDATE t SET v = ? WHERE id = ?';
+const G_DELETE_SENT = 'DELETE FROM t WHERE v = ? AND id = ?';
+
+test('a statement prepared before a lost connection runs as itself on the re-dialled one, never under its old id', async () => {
+  const server = idsPerConnection();
+  await withServer({ handle: server.handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    await c.query(G_UPDATE, ['a', 1]);                          // id 0 on this connection
+    await c.query(G_DELETE, ['b', 2]);                          // id 1
+    srv.closeAll();
+    await until(() => !c.isUsable());
+    // The DELETE first: it takes id 0 on the new connection, the id the
+    // UPDATE had on the old one.
+    await c.query(G_DELETE, ['c', 3]);
+    await c.query(G_UPDATE, ['d', 4]);
+    assert.equal(await c.batch(G_UPDATE, [['e', 5]]), 1);
+    assert.deepEqual(server.texts(), [
+      `${G_UPDATE_SENT} ["a",1]`, `${G_DELETE_SENT} ["b",2]`,
+      `${G_DELETE_SENT} ["c",3]`, `${G_UPDATE_SENT} ["d",4]`, `${G_UPDATE_SENT} [["e",5]]`,
+    ]);
+    assert.equal(srv.requests.filter((q) => q.op === 2).length, 4);   // both prepared again, once each
+    assert.equal(srv.connections, 2);
+    await c.end();
+  });
+
+  // A pooled connection re-dialled while it is checked out, and two pooled
+  // connections side by side: each has its own ids, and its own cache.
+  const pooled = idsPerConnection();
+  await withServer({ handle: pooled.handle }, async (srv) => {
+    const pool = new Pool({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    try {
+      const one = await pool.acquire();
+      const two = await pool.acquire();
+      await one.query(G_UPDATE, ['a', 1]);                      // id 0 on its connection
+      await two.query(G_DELETE, ['b', 2]);                      // id 0 on the other
+      await two.query(G_UPDATE, ['c', 3]);
+      await one.query(G_DELETE, ['d', 4]);
+      srv.closeAll();
+      await until(() => !one.isUsable() && !two.isUsable());
+      await one.query(G_DELETE, ['e', 5]);
+      await one.query(G_UPDATE, ['f', 6]);
+      assert.deepEqual(pooled.texts(), [
+        `${G_UPDATE_SENT} ["a",1]`, `${G_DELETE_SENT} ["b",2]`, `${G_UPDATE_SENT} ["c",3]`, `${G_DELETE_SENT} ["d",4]`,
+        `${G_DELETE_SENT} ["e",5]`, `${G_UPDATE_SENT} ["f",6]`,
+      ]);
+      await pool.release(one);
+      await pool.release(two);
+    } finally {
+      await pool.end();
+    }
+  });
+});
+
+test('a statement the cache did not keep is closed on the connection that prepared it, or not at all', async () => {
+  const server = idsPerConnection();
+  await withServer({ handle: server.handle }, async (srv) => {
+    const c = new Client({ host: '127.0.0.1', port: srv.port, password: 'secret' });
+    await c.connect();
+    for (let i = 0; i < 240; i++) await c.query(`UPDATE t SET v = $1 WHERE ${i} = ${i}`, [i]);   // the cache is full
+    // Not cached, and its connection dies under it: there is nothing to close any more.
+    await assert.rejects(c.query('UPDATE dies SET v = $1', [1]), /connection (closed|lost)/);
+    assert.deepEqual(server.closes, []);
+    // On the new connection the cache starts empty: the next statements are
+    // kept, not closed, and no close goes out for an id of the old connection.
+    await c.query(G_UPDATE, ['a', 1]);
+    await c.query(G_DELETE, ['b', 2]);
+    assert.deepEqual(server.closes, []);
+    assert.equal(c._prepared.size, 2);
+    // Filled again, an uncached statement is closed by the id it has here, on this connection.
+    for (let i = 0; i < 238; i++) await c.query(`UPDATE t SET v = $1 WHERE ${i} = ${i}`, [i]);
+    await c.query('INSERT INTO t (v, id) VALUES ($1, $2)', ['c', 3]);
+    assert.equal(server.closes.length, 1);
+    assert.equal(server.closes[0].sql, 'INSERT INTO t (v, id) VALUES (?, ?)');
+    assert.equal(server.closes[0].sock, server.ran[server.ran.length - 1].sock);
+    assert.equal(srv.connections, 2);
+    await c.end();
+  });
+});
+
 // A server that keeps each connection's session database, as the real one
 // does: a new connection is in `default`, `USE <name>` enters a database
 // (refused for a name in `refuse`), and every other statement is recorded in
